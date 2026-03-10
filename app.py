@@ -77,13 +77,14 @@ scheduler.start()
 def send_confirm_message(user_id, event_name, remind_at):
     date_str, time_str = remind_at.split(' ')
     title = event_name[:38] + '..' if len(event_name) > 40 else event_name
+    short_name = event_name[:18] + '..' if len(event_name) > 20 else event_name
     line_bot_api.push_message(
         user_id,
         TemplateSendMessage(
             alt_text=f'イベント確認：{event_name}',
             template=ButtonsTemplate(
                 title='📅 イベントを検出しました',
-                text=f'名前：{title}\n日時：{date_str} {time_str}',
+                text=f'{short_name}\n{date_str} {time_str}',
                 actions=[
                     PostbackAction(label='✅ このままOK', data='action=confirm'),
                     PostbackAction(label='✏️ 名前を修正', data='action=edit_name'),
@@ -285,6 +286,39 @@ def handle_text(event):
     c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = ?", (user_id,))
     pending = c.fetchone()
 
+    # 📖 説明書
+    if text == '説明書':
+        conn.close()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="📖 使い方ガイド\n"
+                     "━━━━━━━━━━━━━━━\n\n"
+                     "📸 【リマインダーを設定する】\n"
+                     "イベントのチラシや予定表の画像を送ってください。\n"
+                     "日付を自動で読み取り、ボタンが表示されます。\n\n"
+                     "　✅ このままOK → そのまま登録\n"
+                     "　✏️ 名前を修正 → テキストで入力\n"
+                     "　📅 日時を修正 → カレンダーで選択\n\n"
+                     "━━━━━━━━━━━━━━━\n\n"
+                     "📋 【一覧を見る】\n"
+                     "「一覧」と送ると登録済みリマインダーが表示されます。\n\n"
+                     "━━━━━━━━━━━━━━━\n\n"
+                     "🗑️ 【削除する】\n"
+                     "「削除 1」のように番号を指定して送ってください。\n\n"
+                     "━━━━━━━━━━━━━━━\n\n"
+                     "✏️ 【修正する】\n"
+                     "「修正 1」のように番号を指定して送ってください。\n"
+                     "名前またはカレンダーで日時を変更できます。\n\n"
+                     "━━━━━━━━━━━━━━━\n\n"
+                     "🔔 【リマインダー通知】\n"
+                     "設定した日時になると自動でお知らせが届きます。\n\n"
+                     "━━━━━━━━━━━━━━━\n"
+                     "📖「説明書」→ この画面を表示"
+            )
+        )
+        return
+
     # 📋 一覧表示
     if text == '一覧':
         c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at", (user_id,))
@@ -385,7 +419,7 @@ def handle_text(event):
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(
-            text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n\n─────────────\n📋「一覧」→ リマインダー一覧\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正"
+            text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正"
         )
     )
 
