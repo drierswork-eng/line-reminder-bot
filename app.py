@@ -9,7 +9,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage, PostbackEvent,
     TextSendMessage, TemplateSendMessage, ButtonsTemplate,
-    PostbackAction, DatetimepickerAction)
+    PostbackAction, DatetimePickerAction)
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -87,7 +87,7 @@ def send_confirm_message(user_id, event_name, remind_at):
                 actions=[
                     PostbackAction(label='✅ このままOK', data='action=confirm'),
                     PostbackAction(label='✏️ 名前を修正', data='action=edit_name'),
-                    DatetimepickerAction(
+                    DatetimePickerAction(
                         label='📅 日時を修正',
                         data='action=edit_datetime',
                         mode='datetime',
@@ -340,7 +340,7 @@ def handle_text(event):
                         text=f'現在の日時：{remind_at}',
                         actions=[
                             PostbackAction(label='✏️ 名前を修正', data=f'action=edit_existing_name_{rid}'),
-                            DatetimepickerAction(
+                            DatetimePickerAction(
                                 label='📅 日時を修正',
                                 data=f'action=edit_existing_datetime_{rid}',
                                 mode='datetime',
