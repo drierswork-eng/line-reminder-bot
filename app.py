@@ -17,6 +17,9 @@ from linebot.models import (
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
+import pytz
+
+JST = pytz.timezone('Asia/Tokyo')
 
 app = Flask(__name__)
 
@@ -93,7 +96,7 @@ init_db()
 
 # ===== スケジューラー（毎分チェックしてリマインダーを送る） =====
 def check_and_send_reminders():
-    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    now = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT id, user_id, event_name, image_url FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
