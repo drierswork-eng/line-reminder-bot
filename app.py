@@ -52,17 +52,30 @@ def upload_image_to_xserver(image_data, callback):
             ftp.connect(XSERVER_FTP_HOST, 21, timeout=15)
             ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
             ftp.set_pasv(True)
-            # フォルダがなければ自動作成
-            try:
-                ftp.cwd(XSERVER_FTP_PATH)
-            except ftplib.error_perm:
+
+            # XserverのFTPルートはホームディレクトリ（/skateboard.xsrv.jp/）
+            # なのでパスのうち先頭のドメイン部分を除いた相対パスで移動する
+            # 例: /skateboard.xsrv.jp/public_html/InvitationClip/
+            #   → ['skateboard.xsrv.jp', 'public_html', 'InvitationClip'] のうち
+            #     '.' を含む先頭要素（ドメイン）をスキップして移動
+            parts = [p for p in XSERVER_FTP_PATH.split('/') if p]
+            # 先頭がドメイン名（.を含む）なら FTP ルート＝そこなのでスキップ
+            if parts and '.' in parts[0]:
+                parts = parts[1:]
+
+            for part in parts:
                 try:
-                    ftp.mkd(XSERVER_FTP_PATH)
-                    ftp.cwd(XSERVER_FTP_PATH)
-                except Exception as e:
-                    print(f"FTP mkdir error: {e}")
-                    callback(None)
-                    return
+                    ftp.cwd(part)
+                except ftplib.error_perm:
+                    try:
+                        ftp.mkd(part)
+                        ftp.cwd(part)
+                    except Exception as e:
+                        print(f"FTP mkdir error at '{part}': {e}")
+                        callback(None)
+                        ftp.quit()
+                        return
+
             ftp.storbinary(f'STOR {filename}', io.BytesIO(image_data))
             ftp.quit()
             image_url = f"{XSERVER_PUBLIC_URL}{filename}"
