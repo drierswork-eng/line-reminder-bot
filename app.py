@@ -35,7 +35,7 @@ XSERVER_FTP_PASSWORD = os.environ.get('XSERVER_FTP_PASSWORD')
 # ===== Xserver FTP設定 =====
 XSERVER_FTP_HOST = 'sv3112.xserver.jp'
 XSERVER_FTP_USER = 'skateboard'
-XSERVER_FTP_PATH = '/skateboard.xsrv.jp/public_html/InvitationClip/'
+XSERVER_FTP_PATH = 'InvitationClip'
 XSERVER_PUBLIC_URL = 'https://skateboard.xsrv.jp/InvitationClip/'
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
