@@ -5,6 +5,7 @@ import base64
 import ftplib
 import io
 import uuid
+import threading
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, abort
@@ -41,21 +42,36 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ===== 画像をXserverにアップロード =====
-def upload_image_to_xserver(image_data):
-    try:
-        filename = f"{uuid.uuid4().hex}.jpg"
-        ftp = ftplib.FTP(XSERVER_FTP_HOST)
-        ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
-        ftp.cwd(XSERVER_FTP_PATH)
-        ftp.storbinary(f'STOR {filename}', io.BytesIO(image_data))
-        ftp.quit()
-        image_url = f"{XSERVER_PUBLIC_URL}{filename}"
-        print(f"Image uploaded: {image_url}")
-        return image_url
-    except Exception as e:
-        print(f"FTP upload error: {e}")
-        return None
+# ===== 画像をXserverにアップロード（バックグラウンドで実行） =====
+def upload_image_to_xserver(image_data, callback):
+    def _upload():
+        try:
+            filename = f"{uuid.uuid4().hex}.jpg"
+            ftp = ftplib.FTP()
+            ftp.connect(XSERVER_FTP_HOST, 21, timeout=15)
+            ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
+            ftp.set_pasv(True)
+            print(f"FTP connected. Current dir: {ftp.pwd()}")
+            # フォルダがなければ自動作成
+            try:
+                ftp.cwd(XSERVER_FTP_PATH)
+            except ftplib.error_perm:
+                try:
+                    ftp.mkd(XSERVER_FTP_PATH)
+                    ftp.cwd(XSERVER_FTP_PATH)
+                except Exception as e:
+                    print(f"FTP mkdir error: {e}")
+                    callback(None)
+                    return
+            ftp.storbinary(f'STOR {filename}', io.BytesIO(image_data))
+            ftp.quit()
+            image_url = f"{XSERVER_PUBLIC_URL}{filename}"
+            print(f"Image uploaded successfully: {image_url}")
+            callback(image_url)
+        except Exception as e:
+            print(f"FTP upload error: {type(e).__name__}: {e}")
+            callback(None)
+    threading.Thread(target=_upload).start()
 
 
 # ===== データベース接続 =====
@@ -187,12 +203,10 @@ def handle_image(event):
     for chunk in message_content.iter_content():
         image_data += chunk
 
-    # Xserverに画像をアップロード
-    image_url = upload_image_to_xserver(image_data)
-
     image_base64 = base64.b64encode(image_data).decode('utf-8')
 
     try:
+        # OpenAIで画像を分析
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{
@@ -231,18 +245,35 @@ def handle_image(event):
             event_time = data.get("event_time", "09:00")
             remind_at = f"{event_date} {event_time}"
 
+            # まず画像なしで確認メッセージを送る
             conn = get_conn()
             c = conn.cursor()
             c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
-                         VALUES (%s, %s, %s, 'confirm', %s)
+                         VALUES (%s, %s, %s, 'confirm', NULL)
                          ON CONFLICT (user_id) DO UPDATE
-                         SET event_name=%s, remind_at=%s, state='confirm', image_url=%s""",
-                      (user_id, event_name, remind_at, image_url,
-                       event_name, remind_at, image_url))
+                         SET event_name=%s, remind_at=%s, state='confirm', image_url=NULL""",
+                      (user_id, event_name, remind_at, event_name, remind_at))
             conn.commit()
             conn.close()
 
-            send_confirm_message(user_id, event_name, remind_at, image_url)
+            send_confirm_message(user_id, event_name, remind_at, None)
+
+            # バックグラウンドでFTPアップロードしてDBを更新
+            def on_upload_complete(image_url):
+                if image_url:
+                    try:
+                        conn2 = get_conn()
+                        c2 = conn2.cursor()
+                        c2.execute("UPDATE pending SET image_url=%s WHERE user_id=%s",
+                                   (image_url, user_id))
+                        conn2.commit()
+                        conn2.close()
+                        print(f"Image URL saved to pending: {image_url}")
+                    except Exception as e:
+                        print(f"DB update error: {e}")
+
+            upload_image_to_xserver(image_data, on_upload_complete)
+
         else:
             line_bot_api.push_message(
                 user_id,
