@@ -2,6 +2,9 @@ import os
 import json
 import re
 import base64
+import ftplib
+import io
+import uuid
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, abort
@@ -10,7 +13,7 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage, PostbackEvent,
     TextSendMessage, TemplateSendMessage, ButtonsTemplate,
-    PostbackAction, DatetimePickerAction)
+    PostbackAction, DatetimePickerAction, ImageSendMessage)
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -22,10 +25,34 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 DATABASE_URL = os.environ.get('DATABASE_URL')
+XSERVER_FTP_PASSWORD = os.environ.get('XSERVER_FTP_PASSWORD')
+
+# ===== Xserver FTP設定 =====
+XSERVER_FTP_HOST = 'sv3112.xserver.jp'
+XSERVER_FTP_USER = 'skateboard'
+XSERVER_FTP_PATH = '/skateboard.xsrv.jp/public_html/InvitationClip/'
+XSERVER_PUBLIC_URL = 'https://skateboard.xsrv.jp/InvitationClip/'
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ===== 画像をXserverにアップロード =====
+def upload_image_to_xserver(image_data):
+    try:
+        filename = f"{uuid.uuid4().hex}.jpg"
+        ftp = ftplib.FTP(XSERVER_FTP_HOST)
+        ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
+        ftp.cwd(XSERVER_FTP_PATH)
+        ftp.storbinary(f'STOR {filename}', io.BytesIO(image_data))
+        ftp.quit()
+        image_url = f"{XSERVER_PUBLIC_URL}{filename}"
+        print(f"Image uploaded: {image_url}")
+        return image_url
+    except Exception as e:
+        print(f"FTP upload error: {e}")
+        return None
 
 
 # ===== データベース接続 =====
@@ -42,14 +69,22 @@ def init_db():
         user_id TEXT,
         event_name TEXT,
         remind_at TEXT,
+        image_url TEXT,
         sent INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS pending (
         user_id TEXT PRIMARY KEY,
         event_name TEXT,
         remind_at TEXT,
-        state TEXT DEFAULT 'confirm'
+        state TEXT DEFAULT 'confirm',
+        image_url TEXT
     )''')
+    # 既存テーブルにimage_urlカラムがない場合は追加
+    try:
+        c.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS image_url TEXT")
+        c.execute("ALTER TABLE pending ADD COLUMN IF NOT EXISTS image_url TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -61,14 +96,21 @@ def check_and_send_reminders():
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, event_name FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
+    c.execute("SELECT id, user_id, event_name, image_url FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
     reminders = c.fetchall()
-    for rid, user_id, event_name in reminders:
+    for rid, user_id, event_name, image_url in reminders:
         try:
-            line_bot_api.push_message(
-                user_id,
-                TextSendMessage(text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n楽しんできてください😊")
-            )
+            messages = []
+            # 画像があれば一緒に送る
+            if image_url:
+                messages.append(ImageSendMessage(
+                    original_content_url=image_url,
+                    preview_image_url=image_url
+                ))
+            messages.append(TextSendMessage(
+                text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n楽しんできてください😊"
+            ))
+            line_bot_api.push_message(user_id, messages)
             c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (rid,))
         except Exception as e:
             print(f"Error sending reminder: {e}")
@@ -81,31 +123,36 @@ scheduler.start()
 
 
 # ===== 確認ボタンメッセージを送る（カレンダーUI付き） =====
-def send_confirm_message(user_id, event_name, remind_at):
+def send_confirm_message(user_id, event_name, remind_at, image_url=None):
     date_str, time_str = remind_at.split(' ')
     short_name = event_name[:18] + '..' if len(event_name) > 20 else event_name
-    line_bot_api.push_message(
-        user_id,
-        TemplateSendMessage(
-            alt_text=f'イベント確認：{event_name}',
-            template=ButtonsTemplate(
-                title='📅 イベントを検出しました',
-                text=f'{short_name}\n{date_str} {time_str}',
-                actions=[
-                    PostbackAction(label='✅ このままOK', data='action=confirm'),
-                    PostbackAction(label='✏️ 名前を修正', data='action=edit_name'),
-                    DatetimePickerAction(
-                        label='📅 日時を修正',
-                        data='action=edit_datetime',
-                        mode='datetime',
-                        initial=f'{date_str}T{time_str}',
-                        min='2026-01-01T00:00',
-                        max='2030-12-31T23:59'
-                    )
-                ]
-            )
+    messages = []
+    # 画像があれば確認時にも表示
+    if image_url:
+        messages.append(ImageSendMessage(
+            original_content_url=image_url,
+            preview_image_url=image_url
+        ))
+    messages.append(TemplateSendMessage(
+        alt_text=f'イベント確認：{event_name}',
+        template=ButtonsTemplate(
+            title='📅 イベントを検出しました',
+            text=f'{short_name}\n{date_str} {time_str}',
+            actions=[
+                PostbackAction(label='✅ このままOK', data='action=confirm'),
+                PostbackAction(label='✏️ 名前を修正', data='action=edit_name'),
+                DatetimePickerAction(
+                    label='📅 日時を修正',
+                    data='action=edit_datetime',
+                    mode='datetime',
+                    initial=f'{date_str}T{time_str}',
+                    min='2026-01-01T00:00',
+                    max='2030-12-31T23:59'
+                )
+            ]
         )
-    )
+    ))
+    line_bot_api.push_message(user_id, messages)
 
 
 # ===== LINEのWebhookエンドポイント =====
@@ -131,10 +178,15 @@ def handle_image(event):
         TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
     )
 
+    # 画像をダウンロード
     message_content = line_bot_api.get_message_content(message_id)
     image_data = b''
     for chunk in message_content.iter_content():
         image_data += chunk
+
+    # Xserverに画像をアップロード
+    image_url = upload_image_to_xserver(image_data)
+
     image_base64 = base64.b64encode(image_data).decode('utf-8')
 
     try:
@@ -178,15 +230,16 @@ def handle_image(event):
 
             conn = get_conn()
             c = conn.cursor()
-            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
-                         VALUES (%s, %s, %s, 'confirm')
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
+                         VALUES (%s, %s, %s, 'confirm', %s)
                          ON CONFLICT (user_id) DO UPDATE
-                         SET event_name=%s, remind_at=%s, state='confirm'""",
-                      (user_id, event_name, remind_at, event_name, remind_at))
+                         SET event_name=%s, remind_at=%s, state='confirm', image_url=%s""",
+                      (user_id, event_name, remind_at, image_url,
+                       event_name, remind_at, image_url))
             conn.commit()
             conn.close()
 
-            send_confirm_message(user_id, event_name, remind_at)
+            send_confirm_message(user_id, event_name, remind_at, image_url)
         else:
             line_bot_api.push_message(
                 user_id,
@@ -210,14 +263,14 @@ def handle_postback(event):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = %s", (user_id,))
+    c.execute("SELECT event_name, remind_at, state, image_url FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # ✅ このままOK → リマインダー確定
     if data == 'action=confirm' and pending:
-        event_name, remind_at, _ = pending
-        c.execute("INSERT INTO reminders (user_id, event_name, remind_at) VALUES (%s, %s, %s)",
-                  (user_id, event_name, remind_at))
+        event_name, remind_at, _, image_url = pending
+        c.execute("INSERT INTO reminders (user_id, event_name, remind_at, image_url) VALUES (%s, %s, %s, %s)",
+                  (user_id, event_name, remind_at, image_url))
         c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
         conn.commit()
         conn.close()
@@ -238,9 +291,9 @@ def handle_postback(event):
             TextSendMessage(text="✏️ 新しいイベント名を入力してください：")
         )
 
-    # 📅 日時を修正（新規）→ カレンダーUIから日時が返ってくる
+    # 📅 日時を修正（新規）
     elif data == 'action=edit_datetime' and pending:
-        event_name, _, _ = pending
+        event_name, _, _, image_url = pending
         new_datetime = params.get('datetime', '')
         new_remind_at = new_datetime.replace('T', ' ')
         c.execute("UPDATE pending SET remind_at = %s, state = 'confirm' WHERE user_id = %s",
@@ -251,15 +304,15 @@ def handle_postback(event):
             event.reply_token,
             TextSendMessage(text=f"📅 日時を {new_remind_at} に変更しました！\n内容を確認してください👇")
         )
-        send_confirm_message(user_id, event_name, new_remind_at)
+        send_confirm_message(user_id, event_name, new_remind_at, image_url)
 
     # ✏️ 既存リマインダーの名前を修正
     elif data.startswith('action=edit_existing_name_'):
         rid = int(data.split('_')[-1])
-        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
-                     VALUES (%s, '', '', %s)
+        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
+                     VALUES (%s, '', '', %s, NULL)
                      ON CONFLICT (user_id) DO UPDATE
-                     SET event_name='', remind_at='', state=%s""",
+                     SET event_name='', remind_at='', state=%s, image_url=NULL""",
                   (user_id, f'edit_existing_name_{rid}', f'edit_existing_name_{rid}'))
         conn.commit()
         conn.close()
@@ -268,7 +321,7 @@ def handle_postback(event):
             TextSendMessage(text="✏️ 新しいイベント名を入力してください：")
         )
 
-    # 📅 既存リマインダーの日時を修正 → カレンダーUIから日時が返ってくる
+    # 📅 既存リマインダーの日時を修正
     elif data.startswith('action=edit_existing_datetime_'):
         rid = int(data.split('_')[-1])
         new_datetime = params.get('datetime', '')
@@ -295,7 +348,7 @@ def handle_text(event):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = %s", (user_id,))
+    c.execute("SELECT event_name, remind_at, state, image_url FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # 📖 説明書
@@ -324,7 +377,7 @@ def handle_text(event):
                      "名前またはカレンダーで日時を変更できます。\n\n"
                      "━━━━━━━━━━━━━━━\n\n"
                      "🔔 【リマインダー通知】\n"
-                     "設定した日時になると自動でお知らせが届きます。\n\n"
+                     "設定した日時になると画像と一緒にお知らせが届きます。\n\n"
                      "━━━━━━━━━━━━━━━\n"
                      "📖「説明書」→ この画面を表示"
             )
@@ -346,7 +399,7 @@ def handle_text(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return
 
-    # 🗑️ 削除コマンド（例：「削除 1」）
+    # 🗑️ 削除コマンド
     delete_match = re.match(r'^削除\s*(\d+)$', text)
     if delete_match:
         index = int(delete_match.group(1))
@@ -363,7 +416,7 @@ def handle_text(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
         return
 
-    # ✏️ 修正コマンド（例：「修正 1」）
+    # ✏️ 修正コマンド
     edit_match = re.match(r'^修正\s*(\d+)$', text)
     if edit_match:
         index = int(edit_match.group(1))
@@ -371,10 +424,10 @@ def handle_text(event):
         reminders = c.fetchall()
         if 1 <= index <= len(reminders):
             rid, name, remind_at = reminders[index - 1]
-            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
-                         VALUES (%s, %s, %s, %s)
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
+                         VALUES (%s, %s, %s, %s, NULL)
                          ON CONFLICT (user_id) DO UPDATE
-                         SET event_name=%s, remind_at=%s, state=%s""",
+                         SET event_name=%s, remind_at=%s, state=%s, image_url=NULL""",
                       (user_id, name, remind_at, f'edit_existing_{rid}',
                        name, remind_at, f'edit_existing_{rid}'))
             conn.commit()
@@ -407,16 +460,16 @@ def handle_text(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
         return
 
-    # ✏️ 名前の入力待ち（新規）
+    # ✏️ 名前の入力待ち
     if pending:
-        event_name, remind_at, state = pending
+        event_name, remind_at, state, image_url = pending
 
         if state == 'edit_name':
             c.execute("UPDATE pending SET event_name = %s, state = 'confirm' WHERE user_id = %s", (text, user_id))
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✏️ イベント名を「{text}」に変更しました！\n内容を確認してください👇"))
-            send_confirm_message(user_id, text, remind_at)
+            send_confirm_message(user_id, text, remind_at, image_url)
             return
 
         elif state.startswith('edit_existing_name_'):
