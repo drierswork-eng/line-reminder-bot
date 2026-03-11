@@ -4,3 +4,4 @@ openai
 apscheduler
 pytz
 gunicorn
+psycopg2-binary
