@@ -6,6 +6,7 @@ import ftplib
 import io
 import uuid
 import threading
+import time
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, abort
@@ -51,7 +52,6 @@ def upload_image_to_xserver(image_data, callback):
             ftp.connect(XSERVER_FTP_HOST, 21, timeout=15)
             ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
             ftp.set_pasv(True)
-            print(f"FTP connected. Current dir: {ftp.pwd()}")
             # フォルダがなければ自動作成
             try:
                 ftp.cwd(XSERVER_FTP_PATH)
@@ -107,7 +107,14 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+for _i in range(5):
+    try:
+        init_db()
+        print("DB initialized successfully.")
+        break
+    except Exception as _e:
+        print(f"DB init error (attempt {_i + 1}/5): {_e}")
+        time.sleep(3)
 
 
 # ===== スケジューラー（毎分チェックしてリマインダーを送る） =====
