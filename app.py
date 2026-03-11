@@ -2,13 +2,13 @@ import os
 import json
 import re
 import base64
-import ftplib
 import io
-import uuid
 import threading
 import time
 import psycopg2
 import psycopg2.extras
+import cloudinary
+import cloudinary.uploader
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -30,54 +30,33 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 DATABASE_URL = os.environ.get('DATABASE_URL')
-XSERVER_FTP_PASSWORD = os.environ.get('XSERVER_FTP_PASSWORD')
 
-# ===== Xserver FTP設定 =====
-XSERVER_FTP_HOST = 'sv3112.xserver.jp'
-XSERVER_FTP_USER = 'skateboard'
-XSERVER_FTP_PATH = 'InvitationClip'
-XSERVER_PUBLIC_URL = 'https://skateboard.xsrv.jp/InvitationClip/'
+# ===== Cloudinary設定 =====
+cloudinary.config(
+    cloud_name=os.environ.get('CLOUDINARY_CLOUD_NAME', 'dzeex2b4y'),
+    api_key=os.environ.get('CLOUDINARY_API_KEY', '831251356737948'),
+    api_secret=os.environ.get('CLOUDINARY_API_SECRET')
+)
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ===== 画像をXserverにアップロード（バックグラウンドで実行） =====
+# ===== 画像をCloudinaryにアップロード（バックグラウンドで実行） =====
 def upload_image_to_xserver(image_data, callback):
     def _upload():
         try:
-            filename = f"{uuid.uuid4().hex}.jpg"
-            ftp = ftplib.FTP()
-            ftp.connect(XSERVER_FTP_HOST, 21, timeout=15)
-            ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
-            ftp.set_pasv(True)
-
-            # パスを1階層ずつ順番に移動する（絶対パス指定はXserverで失敗するため）
-            # 例: /skateboard.xsrv.jp/public_html/InvitationClip/
-            #   → 'skateboard.xsrv.jp' → 'public_html' → 'InvitationClip' の順に cwd
-            parts = [p for p in XSERVER_FTP_PATH.split('/') if p]
-
-            for part in parts:
-                try:
-                    ftp.cwd(part)
-                except ftplib.error_perm:
-                    try:
-                        ftp.mkd(part)
-                        ftp.cwd(part)
-                    except Exception as e:
-                        print(f"FTP mkdir error at '{part}': {e}")
-                        callback(None)
-                        ftp.quit()
-                        return
-
-            ftp.storbinary(f'STOR {filename}', io.BytesIO(image_data))
-            ftp.quit()
-            image_url = f"{XSERVER_PUBLIC_URL}{filename}"
+            result = cloudinary.uploader.upload(
+                io.BytesIO(image_data),
+                folder='InvitationClip',
+                resource_type='image'
+            )
+            image_url = result['secure_url']
             print(f"Image uploaded successfully: {image_url}")
             callback(image_url)
         except Exception as e:
-            print(f"FTP upload error: {type(e).__name__}: {e}")
+            print(f"Cloudinary upload error: {type(e).__name__}: {e}")
             callback(None)
     threading.Thread(target=_upload).start()
 
