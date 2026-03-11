@@ -53,15 +53,10 @@ def upload_image_to_xserver(image_data, callback):
             ftp.login(XSERVER_FTP_USER, XSERVER_FTP_PASSWORD)
             ftp.set_pasv(True)
 
-            # XserverのFTPルートはホームディレクトリ（/skateboard.xsrv.jp/）
-            # なのでパスのうち先頭のドメイン部分を除いた相対パスで移動する
+            # パスを1階層ずつ順番に移動する（絶対パス指定はXserverで失敗するため）
             # 例: /skateboard.xsrv.jp/public_html/InvitationClip/
-            #   → ['skateboard.xsrv.jp', 'public_html', 'InvitationClip'] のうち
-            #     '.' を含む先頭要素（ドメイン）をスキップして移動
+            #   → 'skateboard.xsrv.jp' → 'public_html' → 'InvitationClip' の順に cwd
             parts = [p for p in XSERVER_FTP_PATH.split('/') if p]
-            # 先頭がドメイン名（.を含む）なら FTP ルート＝そこなのでスキップ
-            if parts and '.' in parts[0]:
-                parts = parts[1:]
 
             for part in parts:
                 try:
