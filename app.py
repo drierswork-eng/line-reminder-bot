@@ -2,7 +2,8 @@ import os
 import json
 import re
 import base64
-import sqlite3
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -20,18 +21,24 @@ app = Flask(__name__)
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+# ===== データベース接続 =====
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+
 # ===== データベースの初期化 =====
 def init_db():
-    conn = sqlite3.connect('reminders.db')
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS reminders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         user_id TEXT,
         event_name TEXT,
         remind_at TEXT,
@@ -52,9 +59,9 @@ init_db()
 # ===== スケジューラー（毎分チェックしてリマインダーを送る） =====
 def check_and_send_reminders():
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
-    conn = sqlite3.connect('reminders.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, event_name FROM reminders WHERE remind_at <= ? AND sent = 0", (now,))
+    c.execute("SELECT id, user_id, event_name FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
     reminders = c.fetchall()
     for rid, user_id, event_name in reminders:
         try:
@@ -62,7 +69,7 @@ def check_and_send_reminders():
                 user_id,
                 TextSendMessage(text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n楽しんできてください😊")
             )
-            c.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (rid,))
+            c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (rid,))
         except Exception as e:
             print(f"Error sending reminder: {e}")
     conn.commit()
@@ -76,7 +83,6 @@ scheduler.start()
 # ===== 確認ボタンメッセージを送る（カレンダーUI付き） =====
 def send_confirm_message(user_id, event_name, remind_at):
     date_str, time_str = remind_at.split(' ')
-    title = event_name[:38] + '..' if len(event_name) > 40 else event_name
     short_name = event_name[:18] + '..' if len(event_name) > 20 else event_name
     line_bot_api.push_message(
         user_id,
@@ -170,10 +176,13 @@ def handle_image(event):
             event_time = data.get("event_time", "09:00")
             remind_at = f"{event_date} {event_time}"
 
-            conn = sqlite3.connect('reminders.db')
+            conn = get_conn()
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO pending VALUES (?, ?, ?, ?)",
-                      (user_id, event_name, remind_at, 'confirm'))
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
+                         VALUES (%s, %s, %s, 'confirm')
+                         ON CONFLICT (user_id) DO UPDATE
+                         SET event_name=%s, remind_at=%s, state='confirm'""",
+                      (user_id, event_name, remind_at, event_name, remind_at))
             conn.commit()
             conn.close()
 
@@ -199,17 +208,17 @@ def handle_postback(event):
     data = event.postback.data
     params = event.postback.params
 
-    conn = sqlite3.connect('reminders.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = ?", (user_id,))
+    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # ✅ このままOK → リマインダー確定
     if data == 'action=confirm' and pending:
         event_name, remind_at, _ = pending
-        c.execute("INSERT INTO reminders (user_id, event_name, remind_at) VALUES (?, ?, ?)",
+        c.execute("INSERT INTO reminders (user_id, event_name, remind_at) VALUES (%s, %s, %s)",
                   (user_id, event_name, remind_at))
-        c.execute("DELETE FROM pending WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
         conn.commit()
         conn.close()
         line_bot_api.reply_message(
@@ -221,7 +230,7 @@ def handle_postback(event):
 
     # ✏️ 名前を修正（新規）
     elif data == 'action=edit_name' and pending:
-        c.execute("UPDATE pending SET state = 'edit_name' WHERE user_id = ?", (user_id,))
+        c.execute("UPDATE pending SET state = 'edit_name' WHERE user_id = %s", (user_id,))
         conn.commit()
         conn.close()
         line_bot_api.reply_message(
@@ -234,7 +243,7 @@ def handle_postback(event):
         event_name, _, _ = pending
         new_datetime = params.get('datetime', '')
         new_remind_at = new_datetime.replace('T', ' ')
-        c.execute("UPDATE pending SET remind_at = ?, state = 'confirm' WHERE user_id = ?",
+        c.execute("UPDATE pending SET remind_at = %s, state = 'confirm' WHERE user_id = %s",
                   (new_remind_at, user_id))
         conn.commit()
         conn.close()
@@ -247,8 +256,11 @@ def handle_postback(event):
     # ✏️ 既存リマインダーの名前を修正
     elif data.startswith('action=edit_existing_name_'):
         rid = int(data.split('_')[-1])
-        c.execute("INSERT OR REPLACE INTO pending VALUES (?, ?, ?, ?)",
-                  (user_id, '', '', f'edit_existing_name_{rid}'))
+        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
+                     VALUES (%s, '', '', %s)
+                     ON CONFLICT (user_id) DO UPDATE
+                     SET event_name='', remind_at='', state=%s""",
+                  (user_id, f'edit_existing_name_{rid}', f'edit_existing_name_{rid}'))
         conn.commit()
         conn.close()
         line_bot_api.reply_message(
@@ -261,9 +273,9 @@ def handle_postback(event):
         rid = int(data.split('_')[-1])
         new_datetime = params.get('datetime', '')
         new_remind_at = new_datetime.replace('T', ' ')
-        c.execute("UPDATE reminders SET remind_at = ? WHERE id = ? AND user_id = ?",
+        c.execute("UPDATE reminders SET remind_at = %s WHERE id = %s AND user_id = %s",
                   (new_remind_at, rid, user_id))
-        c.execute("DELETE FROM pending WHERE user_id = ?", (user_id,))
+        c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
         conn.commit()
         conn.close()
         line_bot_api.reply_message(
@@ -281,9 +293,9 @@ def handle_text(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    conn = sqlite3.connect('reminders.db')
+    conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = ?", (user_id,))
+    c.execute("SELECT event_name, remind_at, state FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # 📖 説明書
@@ -321,7 +333,7 @@ def handle_text(event):
 
     # 📋 一覧表示
     if text == '一覧':
-        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at", (user_id,))
+        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
         reminders = c.fetchall()
         conn.close()
         if reminders:
@@ -338,11 +350,11 @@ def handle_text(event):
     delete_match = re.match(r'^削除\s*(\d+)$', text)
     if delete_match:
         index = int(delete_match.group(1))
-        c.execute("SELECT id, event_name FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at", (user_id,))
+        c.execute("SELECT id, event_name FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
         reminders = c.fetchall()
         if 1 <= index <= len(reminders):
             rid, name = reminders[index - 1]
-            c.execute("DELETE FROM reminders WHERE id = ?", (rid,))
+            c.execute("DELETE FROM reminders WHERE id = %s", (rid,))
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🗑️ 「{name}」を削除しました。"))
@@ -355,12 +367,16 @@ def handle_text(event):
     edit_match = re.match(r'^修正\s*(\d+)$', text)
     if edit_match:
         index = int(edit_match.group(1))
-        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY remind_at", (user_id,))
+        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
         reminders = c.fetchall()
         if 1 <= index <= len(reminders):
             rid, name, remind_at = reminders[index - 1]
-            c.execute("INSERT OR REPLACE INTO pending VALUES (?, ?, ?, ?)",
-                      (user_id, name, remind_at, f'edit_existing_{rid}'))
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state)
+                         VALUES (%s, %s, %s, %s)
+                         ON CONFLICT (user_id) DO UPDATE
+                         SET event_name=%s, remind_at=%s, state=%s""",
+                      (user_id, name, remind_at, f'edit_existing_{rid}',
+                       name, remind_at, f'edit_existing_{rid}'))
             conn.commit()
             conn.close()
             date_str, time_str = remind_at.split(' ')
@@ -396,18 +412,17 @@ def handle_text(event):
         event_name, remind_at, state = pending
 
         if state == 'edit_name':
-            c.execute("UPDATE pending SET event_name = ?, state = 'confirm' WHERE user_id = ?", (text, user_id))
+            c.execute("UPDATE pending SET event_name = %s, state = 'confirm' WHERE user_id = %s", (text, user_id))
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✏️ イベント名を「{text}」に変更しました！\n内容を確認してください👇"))
             send_confirm_message(user_id, text, remind_at)
             return
 
-        # ✏️ 名前の入力待ち（既存リマインダー修正）
         elif state.startswith('edit_existing_name_'):
             rid = int(state.split('_')[-1])
-            c.execute("UPDATE reminders SET event_name = ? WHERE id = ? AND user_id = ?", (text, rid, user_id))
-            c.execute("DELETE FROM pending WHERE user_id = ?", (user_id,))
+            c.execute("UPDATE reminders SET event_name = %s WHERE id = %s AND user_id = %s", (text, rid, user_id))
+            c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ イベント名を「{text}」に変更しました！"))
