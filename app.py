@@ -168,6 +168,12 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None):
     line_bot_api.push_message(user_id, messages)
 
 
+# ===== ヘルスチェック用エンドポイント（UptimeRobot用） =====
+@app.route("/", methods=['GET'])
+def health_check():
+    return 'OK', 200
+
+
 # ===== LINEのWebhookエンドポイント =====
 @app.route("/callback", methods=['POST'])
 def callback():
