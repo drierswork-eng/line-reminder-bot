@@ -15,7 +15,8 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage, PostbackEvent,
     TextSendMessage, TemplateSendMessage, ButtonsTemplate,
-    PostbackAction, DatetimePickerAction, ImageSendMessage)
+    PostbackAction, DatetimePickerAction, ImageSendMessage,
+    QuickReply, QuickReplyButton)
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -76,6 +77,7 @@ def init_db():
         event_name TEXT,
         remind_at TEXT,
         image_url TEXT,
+        location TEXT,
         sent INTEGER DEFAULT 0
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS pending (
@@ -83,12 +85,14 @@ def init_db():
         event_name TEXT,
         remind_at TEXT,
         state TEXT DEFAULT 'confirm',
-        image_url TEXT
+        image_url TEXT,
+        location TEXT
     )''')
-    # 既存テーブルにimage_urlカラムがない場合は追加
     try:
         c.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS image_url TEXT")
         c.execute("ALTER TABLE pending ADD COLUMN IF NOT EXISTS image_url TEXT")
+        c.execute("ALTER TABLE reminders ADD COLUMN IF NOT EXISTS location TEXT")
+        c.execute("ALTER TABLE pending ADD COLUMN IF NOT EXISTS location TEXT")
     except Exception:
         pass
     conn.commit()
@@ -109,10 +113,11 @@ def check_and_send_reminders():
     now = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, event_name, image_url FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
+    c.execute("SELECT id, user_id, event_name, image_url, location FROM reminders WHERE remind_at <= %s AND sent = 0", (now,))
     reminders = c.fetchall()
-    for rid, user_id, event_name, image_url in reminders:
+    for rid, user_id, event_name, image_url, location in reminders:
         try:
+            loc = location if location else "場所不明"
             messages = []
             # 画像があれば一緒に送る
             if image_url:
@@ -121,7 +126,7 @@ def check_and_send_reminders():
                     preview_image_url=image_url
                 ))
             messages.append(TextSendMessage(
-                text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n楽しんできてください😊"
+                text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n📍 {loc}\n楽しんできてください😊"
             ))
             line_bot_api.push_message(user_id, messages)
             c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (rid,))
@@ -135,10 +140,10 @@ scheduler.add_job(check_and_send_reminders, 'interval', minutes=1)
 scheduler.start()
 
 
-# ===== 確認ボタンメッセージを送る（カレンダーUI付き） =====
-def send_confirm_message(user_id, event_name, remind_at, image_url=None):
+# ===== 確認メッセージを送る（QuickReply付き・5ボタン対応） =====
+def send_confirm_message(user_id, event_name, remind_at, image_url=None, location="場所不明"):
     date_str, time_str = remind_at.split(' ')
-    short_name = event_name[:18] + '..' if len(event_name) > 20 else event_name
+    loc = location if location else "場所不明"
     messages = []
     # 画像があれば確認時にも表示
     if image_url:
@@ -146,24 +151,30 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None):
             original_content_url=image_url,
             preview_image_url=image_url
         ))
-    messages.append(TemplateSendMessage(
-        alt_text=f'イベント確認：{event_name}',
-        template=ButtonsTemplate(
-            title='📅 イベントを検出しました',
-            text=f'{short_name}\n{date_str} {time_str}',
-            actions=[
-                PostbackAction(label='✅ このままOK', data='action=confirm'),
-                PostbackAction(label='✏️ 名前を修正', data='action=edit_name'),
-                DatetimePickerAction(
-                    label='📅 日時を修正',
-                    data='action=edit_datetime',
-                    mode='datetime',
-                    initial=f'{date_str}T{time_str}',
-                    min='2026-01-01T00:00',
-                    max='2030-12-31T23:59'
-                )
-            ]
-        )
+    messages.append(TextSendMessage(
+        text=(
+            f"📅 イベントを検出しました\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📌 {event_name}\n"
+            f"⏰ {date_str} {time_str}\n"
+            f"📍 {loc}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"下のボタンで確認・修正してください👇"
+        ),
+        quick_reply=QuickReply(items=[
+            QuickReplyButton(action=PostbackAction(label='✅ このままOK', data='action=confirm')),
+            QuickReplyButton(action=PostbackAction(label='✏️ 名前を修正', data='action=edit_name')),
+            QuickReplyButton(action=DatetimePickerAction(
+                label='📅 日時を修正',
+                data='action=edit_datetime',
+                mode='datetime',
+                initial=f'{date_str}T{time_str}',
+                min='2026-01-01T00:00',
+                max='2030-12-31T23:59'
+            )),
+            QuickReplyButton(action=PostbackAction(label='📍 場所を修正', data='action=edit_location')),
+            QuickReplyButton(action=PostbackAction(label='❌ キャンセル', data='action=cancel')),
+        ])
     ))
     line_bot_api.push_message(user_id, messages)
 
@@ -220,11 +231,13 @@ def handle_image(event):
   "found": true,
   "event_name": "イベント名",
   "event_date": "YYYY-MM-DD",
-  "event_time": "HH:MM"
+  "event_time": "HH:MM",
+  "event_location": "場所名"
 }
 日付が見つからない場合: {"found": false}
 ・年が書いていない場合は2026年を使用
-・時間が書いていない場合は"09:00"を使用"""
+・時間が書いていない場合は"09:00"を使用
+・場所が画像に明記されていない場合は必ず"場所不明"を使用（憶測で入れない）"""
                     },
                     {
                         "type": "image_url",
@@ -243,20 +256,21 @@ def handle_image(event):
             event_name = data.get("event_name", "イベント")
             event_date = data.get("event_date", "")
             event_time = data.get("event_time", "09:00")
+            event_location = data.get("event_location") or "場所不明"
             remind_at = f"{event_date} {event_time}"
 
             # まず画像なしで確認メッセージを送る
             conn = get_conn()
             c = conn.cursor()
-            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
-                         VALUES (%s, %s, %s, 'confirm', NULL)
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+                         VALUES (%s, %s, %s, 'confirm', NULL, %s)
                          ON CONFLICT (user_id) DO UPDATE
-                         SET event_name=%s, remind_at=%s, state='confirm', image_url=NULL""",
-                      (user_id, event_name, remind_at, event_name, remind_at))
+                         SET event_name=%s, remind_at=%s, state='confirm', image_url=NULL, location=%s""",
+                      (user_id, event_name, remind_at, event_location, event_name, remind_at, event_location))
             conn.commit()
             conn.close()
 
-            send_confirm_message(user_id, event_name, remind_at, None)
+            send_confirm_message(user_id, event_name, remind_at, None, event_location)
 
             # バックグラウンドでFTPアップロードしてDBを更新
             def on_upload_complete(image_url):
@@ -297,22 +311,33 @@ def handle_postback(event):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state, image_url FROM pending WHERE user_id = %s", (user_id,))
+    c.execute("SELECT event_name, remind_at, state, image_url, location FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # ✅ このままOK → リマインダー確定
     if data == 'action=confirm' and pending:
-        event_name, remind_at, _, image_url = pending
-        c.execute("INSERT INTO reminders (user_id, event_name, remind_at, image_url) VALUES (%s, %s, %s, %s)",
-                  (user_id, event_name, remind_at, image_url))
+        event_name, remind_at, _, image_url, location = pending
+        loc = location if location else "場所不明"
+        c.execute("INSERT INTO reminders (user_id, event_name, remind_at, image_url, location) VALUES (%s, %s, %s, %s, %s)",
+                  (user_id, event_name, remind_at, image_url, loc))
         c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
         conn.commit()
         conn.close()
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text=f"✅ リマインダーを設定しました！\n\n📌 {event_name}\n⏰ {remind_at}\n\n時間になったらお知らせします🔔"
+                text=f"✅ リマインダーを設定しました！\n\n📌 {event_name}\n⏰ {remind_at}\n📍 {loc}\n\n時間になったらお知らせします🔔"
             )
+        )
+
+    # ❌ キャンセル
+    elif data == 'action=cancel':
+        c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="❌ キャンセルしました。\n別の画像を送ってください📸")
         )
 
     # ✏️ 名前を修正（新規）
@@ -327,7 +352,7 @@ def handle_postback(event):
 
     # 📅 日時を修正（新規）
     elif data == 'action=edit_datetime' and pending:
-        event_name, _, _, image_url = pending
+        event_name, _, _, image_url, location = pending
         new_datetime = params.get('datetime', '')
         new_remind_at = new_datetime.replace('T', ' ')
         c.execute("UPDATE pending SET remind_at = %s, state = 'confirm' WHERE user_id = %s",
@@ -338,13 +363,23 @@ def handle_postback(event):
             event.reply_token,
             TextSendMessage(text=f"📅 日時を {new_remind_at} に変更しました！\n内容を確認してください👇")
         )
-        send_confirm_message(user_id, event_name, new_remind_at, image_url)
+        send_confirm_message(user_id, event_name, new_remind_at, image_url, location)
+
+    # 📍 場所を修正（新規）
+    elif data == 'action=edit_location' and pending:
+        c.execute("UPDATE pending SET state = 'edit_location' WHERE user_id = %s", (user_id,))
+        conn.commit()
+        conn.close()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="📍 新しい場所を入力してください：")
+        )
 
     # ✏️ 既存リマインダーの名前を修正
     elif data.startswith('action=edit_existing_name_'):
         rid = int(data.split('_')[-1])
-        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
-                     VALUES (%s, '', '', %s, NULL)
+        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+                     VALUES (%s, '', '', %s, NULL, NULL)
                      ON CONFLICT (user_id) DO UPDATE
                      SET event_name='', remind_at='', state=%s, image_url=NULL""",
                   (user_id, f'edit_existing_name_{rid}', f'edit_existing_name_{rid}'))
@@ -370,6 +405,21 @@ def handle_postback(event):
             TextSendMessage(text=f"✅ 日時を {new_remind_at} に変更しました！")
         )
 
+    # 📍 既存リマインダーの場所を修正
+    elif data.startswith('action=edit_existing_location_'):
+        rid = int(data.split('_')[-1])
+        c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+                     VALUES (%s, '', '', %s, NULL, NULL)
+                     ON CONFLICT (user_id) DO UPDATE
+                     SET event_name='', remind_at='', state=%s, image_url=NULL""",
+                  (user_id, f'edit_existing_location_{rid}', f'edit_existing_location_{rid}'))
+        conn.commit()
+        conn.close()
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="📍 新しい場所を入力してください：")
+        )
+
     else:
         conn.close()
 
@@ -382,7 +432,7 @@ def handle_text(event):
 
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT event_name, remind_at, state, image_url FROM pending WHERE user_id = %s", (user_id,))
+    c.execute("SELECT event_name, remind_at, state, image_url, location FROM pending WHERE user_id = %s", (user_id,))
     pending = c.fetchone()
 
     # 📖 説明書
@@ -420,13 +470,14 @@ def handle_text(event):
 
     # 📋 一覧表示
     if text == '一覧':
-        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
+        c.execute("SELECT id, event_name, remind_at, location FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
         reminders = c.fetchall()
         conn.close()
         if reminders:
             msg = "📋 設定中のリマインダー\n\n"
-            for i, (rid, name, remind_at) in enumerate(reminders, 1):
-                msg += f"{i}. {name}\n   ⏰ {remind_at}\n\n"
+            for i, (rid, name, remind_at, location) in enumerate(reminders, 1):
+                loc = location if location else "場所不明"
+                msg += f"{i}. {name}\n   ⏰ {remind_at}\n   📍 {loc}\n\n"
             msg += "─────────────\n🗑️ 削除する →「削除 番号」\n✏️ 修正する →「修正 番号」"
         else:
             msg = "設定中のリマインダーはありません。\nチラシの画像を送ってください！"
@@ -454,16 +505,17 @@ def handle_text(event):
     edit_match = re.match(r'^修正\s*(\d+)$', text)
     if edit_match:
         index = int(edit_match.group(1))
-        c.execute("SELECT id, event_name, remind_at FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
+        c.execute("SELECT id, event_name, remind_at, location FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
         reminders = c.fetchall()
         if 1 <= index <= len(reminders):
-            rid, name, remind_at = reminders[index - 1]
-            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url)
-                         VALUES (%s, %s, %s, %s, NULL)
+            rid, name, remind_at, location = reminders[index - 1]
+            loc = location if location else "場所不明"
+            c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+                         VALUES (%s, %s, %s, %s, NULL, %s)
                          ON CONFLICT (user_id) DO UPDATE
-                         SET event_name=%s, remind_at=%s, state=%s, image_url=NULL""",
-                      (user_id, name, remind_at, f'edit_existing_{rid}',
-                       name, remind_at, f'edit_existing_{rid}'))
+                         SET event_name=%s, remind_at=%s, state=%s, image_url=NULL, location=%s""",
+                      (user_id, name, remind_at, f'edit_existing_{rid}', loc,
+                       name, remind_at, f'edit_existing_{rid}', loc))
             conn.commit()
             conn.close()
             date_str, time_str = remind_at.split(' ')
@@ -474,7 +526,7 @@ def handle_text(event):
                     alt_text=f'修正：{name}',
                     template=ButtonsTemplate(
                         title=f'✏️ {title}',
-                        text=f'現在の日時：{remind_at}',
+                        text=f'{remind_at}\n📍 {loc[:20]}',
                         actions=[
                             PostbackAction(label='✏️ 名前を修正', data=f'action=edit_existing_name_{rid}'),
                             DatetimePickerAction(
@@ -484,7 +536,8 @@ def handle_text(event):
                                 initial=f'{date_str}T{time_str}',
                                 min='2026-01-01T00:00',
                                 max='2030-12-31T23:59'
-                            )
+                            ),
+                            PostbackAction(label='📍 場所を修正', data=f'action=edit_existing_location_{rid}'),
                         ]
                     )
                 )
@@ -494,16 +547,24 @@ def handle_text(event):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
         return
 
-    # ✏️ 名前の入力待ち
+    # ✏️ 名前・場所の入力待ち
     if pending:
-        event_name, remind_at, state, image_url = pending
+        event_name, remind_at, state, image_url, location = pending
 
         if state == 'edit_name':
             c.execute("UPDATE pending SET event_name = %s, state = 'confirm' WHERE user_id = %s", (text, user_id))
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✏️ イベント名を「{text}」に変更しました！\n内容を確認してください👇"))
-            send_confirm_message(user_id, text, remind_at, image_url)
+            send_confirm_message(user_id, text, remind_at, image_url, location)
+            return
+
+        elif state == 'edit_location':
+            c.execute("UPDATE pending SET location = %s, state = 'confirm' WHERE user_id = %s", (text, user_id))
+            conn.commit()
+            conn.close()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📍 場所を「{text}」に変更しました！\n内容を確認してください👇"))
+            send_confirm_message(user_id, event_name, remind_at, image_url, text)
             return
 
         elif state.startswith('edit_existing_name_'):
@@ -513,6 +574,15 @@ def handle_text(event):
             conn.commit()
             conn.close()
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ イベント名を「{text}」に変更しました！"))
+            return
+
+        elif state.startswith('edit_existing_location_'):
+            rid = int(state.split('_')[-1])
+            c.execute("UPDATE reminders SET location = %s WHERE id = %s AND user_id = %s", (text, rid, user_id))
+            c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
+            conn.commit()
+            conn.close()
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"✅ 場所を「{text}」に変更しました！"))
             return
 
     conn.close()
