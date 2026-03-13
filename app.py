@@ -405,17 +405,12 @@ def handle_image(event):
             is_first = (oldest_id == pending_id)
 
             if is_first:
-                # 複数枚ある場合はまず件数を通知
-                if total_confirm > 1:
-                    line_bot_api.push_message(user_id, TextSendMessage(
-                        text=f"📸 {total_confirm}件の画像を受け取りました。\n1件ずつ順番に確認します👇"
-                    ))
+                # 先頭の1枚だけ確認メッセージを表示
+                # ※ 複数枚でも余分なpush_messageを出さない
+                #   → 後続メッセージがQuickReplyボタンを消してしまうのを防ぐ
                 send_confirm_message(user_id, event_name, remind_at, None, event_location, pending_id)
-            else:
-                # キューに追加された場合はその旨を通知
-                line_bot_api.push_message(user_id, TextSendMessage(
-                    text=f"📬 「{event_name}」をキューに追加しました（{total_confirm}件待機中）\n現在の確認が終わったら次に表示します。"
-                ))
+            # else: キュー追加はサイレント（push_message不要）
+            # 理由: push_messageを送るとLINEのQuickReplyボタンが消えてしまうため
 
             # バックグラウンドでCloudinaryにアップロードしてDBを更新
             def on_upload_complete(image_url, _pid=pending_id):
