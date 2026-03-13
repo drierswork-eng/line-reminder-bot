@@ -321,10 +321,31 @@ def handle_image(event):
     user_id = event.source.user_id
     message_id = event.message.id
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
-    )
+    # 既存のconfirmペンディングがあるか確認
+    # → あればこの画像はキューに入るため「分析中」を送らない
+    #   （送るとQuickReplyボタンが消えて操作不能になるため）
+    has_existing_pending = False
+    pre_conn = None
+    try:
+        pre_conn = get_conn()
+        pre_c = pre_conn.cursor()
+        pre_c.execute(
+            "SELECT COUNT(*) FROM pending WHERE user_id = %s AND state = 'confirm'",
+            (user_id,)
+        )
+        has_existing_pending = pre_c.fetchone()[0] > 0
+    except Exception as e:
+        print(f"handle_image pre-check error: {e}")
+    finally:
+        if pre_conn:
+            pre_conn.close()
+
+    if not has_existing_pending:
+        # 先頭画像のみ「分析中」を表示（reply_tokenを1回だけ使用）
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
+        )
 
     message_content = line_bot_api.get_message_content(message_id)
     image_data = b''
