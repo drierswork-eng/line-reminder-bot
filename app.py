@@ -138,7 +138,7 @@ def init_db():
                 print("Pending table migrated to new structure.")
             except Exception as e:
                 print(f"Pending migration error: {e}")
-                conn.rollback()  # トランザクション中断をリセット
+                conn.rollback()
                 c.execute('''CREATE TABLE IF NOT EXISTS pending (
                     id SERIAL PRIMARY KEY,
                     user_id TEXT,
@@ -155,6 +155,16 @@ def init_db():
                 c.execute("ALTER TABLE pending ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()")
             except Exception:
                 pass
+
+    # 起動時に古い 'processing' レコードを削除（サーバー再起動後の取りこぼし防止）
+    try:
+        c.execute("""DELETE FROM pending WHERE state = 'processing'
+                     AND created_at < NOW() - INTERVAL '10 minutes'""")
+        deleted = c.rowcount
+        if deleted > 0:
+            print(f"Cleaned up {deleted} stale 'processing' records.")
+    except Exception as e:
+        print(f"Cleanup stale processing error: {e}")
 
     conn.commit()
     conn.close()
@@ -267,7 +277,8 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
 # ===== 次のpendingがあれば確認メッセージを出す =====
 def show_next_pending(user_id, reply_token, done_message):
     next_p = None
-    remaining = 0
+    remaining_confirm = 0
+    remaining_processing = 0
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -276,7 +287,9 @@ def show_next_pending(user_id, reply_token, done_message):
                      ORDER BY created_at LIMIT 1""", (user_id,))
         next_p = c.fetchone()
         c.execute("SELECT COUNT(*) FROM pending WHERE user_id = %s AND state = 'confirm'", (user_id,))
-        remaining = c.fetchone()[0]
+        remaining_confirm = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM pending WHERE user_id = %s AND state = 'processing'", (user_id,))
+        remaining_processing = c.fetchone()[0]
     except Exception as e:
         print(f"show_next_pending DB error: {e}")
     finally:
@@ -284,15 +297,21 @@ def show_next_pending(user_id, reply_token, done_message):
 
     if next_p:
         next_id, next_name, next_at, next_img, next_loc = next_p
-        # remaining にはnext_p自身が含まれるので、残り件数として表示
-        if remaining > 1:
-            suffix = f"\n\nあと{remaining - 1}件キューに入っています。次を確認します👇"
+        # next_p自身を除いた追加待機件数（confirm + processing）
+        additional_waiting = (remaining_confirm - 1) + remaining_processing
+        if additional_waiting > 0:
+            suffix = f"\n\nあと{additional_waiting}件が待機/分析中です。次を確認します👇"
         else:
             suffix = "\n\n次の画像を確認します👇"
         line_bot_api.reply_message(reply_token, TextSendMessage(
             text=f"{done_message}{suffix}"
         ))
         send_confirm_message(user_id, next_name, next_at, next_img, next_loc or "場所不明", next_id)
+    elif remaining_processing > 0:
+        # confirmはないがまだ分析中の画像がある
+        line_bot_api.reply_message(reply_token, TextSendMessage(
+            text=f"{done_message}\n\nあと{remaining_processing}枚の画像を分析中です... しばらくお待ちください⏳"
+        ))
     else:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=done_message))
 
@@ -321,32 +340,51 @@ def handle_image(event):
     user_id = event.source.user_id
     message_id = event.message.id
 
-    # 既存のconfirmペンディングがあるか確認
-    # → あればこの画像はキューに入るため「分析中」を送らない
-    #   （送るとQuickReplyボタンが消えて操作不能になるため）
-    has_existing_pending = False
+    # ===== STEP 1: 「処理中」プレースホルダーをDBに挿入してキュー位置を原子的に確定 =====
+    # 複数画像が同時に届いた場合でも、INSERTの順番（id/created_at）で
+    # キュー内の位置が確定するため競合状態が発生しない
+    placeholder_id = None
+    is_first_in_queue = False
     pre_conn = None
     try:
         pre_conn = get_conn()
         pre_c = pre_conn.cursor()
+        # state='processing' のプレースホルダーを挿入（後でOpenAI解析結果で上書き）
         pre_c.execute(
-            "SELECT COUNT(*) FROM pending WHERE user_id = %s AND state = 'confirm'",
-            (user_id,)
+            """INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+               VALUES (%s, %s, %s, 'processing', NULL, NULL) RETURNING id""",
+            (user_id, '分析中...', '')
         )
-        has_existing_pending = pre_c.fetchone()[0] > 0
+        placeholder_id = pre_c.fetchone()[0]
+        # 自分より前に挿入された confirm/processing レコードがあるか確認
+        pre_c.execute(
+            """SELECT COUNT(*) FROM pending
+               WHERE user_id = %s AND state IN ('confirm', 'processing') AND id < %s""",
+            (user_id, placeholder_id)
+        )
+        earlier_count = pre_c.fetchone()[0]
+        is_first_in_queue = (earlier_count == 0)
+        pre_conn.commit()
     except Exception as e:
-        print(f"handle_image pre-check error: {e}")
+        print(f"handle_image placeholder insert error: {e}")
+        placeholder_id = None
+        is_first_in_queue = False
     finally:
         if pre_conn:
             pre_conn.close()
 
-    if not has_existing_pending:
-        # 先頭画像のみ「分析中」を表示（reply_tokenを1回だけ使用）
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
-        )
+    # 最初の画像だけ「分析中」リプライを送る
+    # 2枚目以降はサイレント（reply_message を送るとQuickReplyボタンが消えるため）
+    if is_first_in_queue:
+        try:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
+            )
+        except Exception as e:
+            print(f"reply_message (分析中) error: {e}")
 
+    # ===== STEP 2: 画像データ取得 =====
     message_content = line_bot_api.get_message_content(message_id)
     image_data = b''
     for chunk in message_content.iter_content():
@@ -355,6 +393,7 @@ def handle_image(event):
     image_base64 = base64.b64encode(image_data).decode('utf-8')
 
     try:
+        # ===== STEP 3: OpenAI で画像を分析 =====
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{
@@ -400,38 +439,45 @@ def handle_image(event):
             try:
                 c = conn.cursor()
 
-                # 新しいpendingレコードを挿入してidを取得
-                c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
-                             VALUES (%s, %s, %s, 'confirm', NULL, %s) RETURNING id""",
-                          (user_id, event_name, remind_at, event_location))
-                pending_id = c.fetchone()[0]
+                if placeholder_id:
+                    # プレースホルダーを実データで上書きして 'confirm' に変更
+                    c.execute("""UPDATE pending
+                                 SET event_name=%s, remind_at=%s, state='confirm', location=%s
+                                 WHERE id=%s AND user_id=%s""",
+                              (event_name, remind_at, event_location, placeholder_id, user_id))
+                    pending_id = placeholder_id
+                else:
+                    # フォールバック（プレースホルダーが失敗した場合）
+                    c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
+                                 VALUES (%s, %s, %s, 'confirm', NULL, %s) RETURNING id""",
+                              (user_id, event_name, remind_at, event_location))
+                    pending_id = c.fetchone()[0]
 
-                # 最古のconfirmレコードを確認（自分が最初かどうか）
-                c.execute("""SELECT id FROM pending WHERE user_id = %s AND state = 'confirm'
-                             ORDER BY created_at LIMIT 1""", (user_id,))
-                oldest_row = c.fetchone()
-                oldest_id = oldest_row[0] if oldest_row else pending_id
+                # 自分より前に 'processing' レコード（まだ分析中の画像）があるか確認
+                # → あれば自分は先頭ではない（それらが終わった後に表示される）
+                c.execute("""SELECT COUNT(*) FROM pending
+                             WHERE user_id = %s AND state = 'processing' AND id < %s""",
+                          (user_id, pending_id))
+                earlier_processing = c.fetchone()[0]
 
-                # 合計待機件数
-                c.execute("SELECT COUNT(*) FROM pending WHERE user_id = %s AND state = 'confirm'", (user_id,))
-                total_confirm = c.fetchone()[0]
+                # 自分が最古の 'confirm' レコードか確認
+                c.execute("""SELECT MIN(id) FROM pending
+                             WHERE user_id = %s AND state = 'confirm'""",
+                          (user_id,))
+                oldest_confirm_id = c.fetchone()[0]
 
                 conn.commit()
             except Exception:
                 conn.rollback()
-                raise  # 外側のexceptに渡す
+                raise
             finally:
                 conn.close()
 
-            is_first = (oldest_id == pending_id)
-
+            # 条件: 自分より前に処理中がなく、かつ自分が最古の confirm → 確認メッセージを表示
+            # これにより複数画像が同時に届いても必ず1件だけ確認メッセージが表示される
+            is_first = (earlier_processing == 0) and (oldest_confirm_id == pending_id)
             if is_first:
-                # 先頭の1枚だけ確認メッセージを表示
-                # ※ 複数枚でも余分なpush_messageを出さない
-                #   → 後続メッセージがQuickReplyボタンを消してしまうのを防ぐ
                 send_confirm_message(user_id, event_name, remind_at, None, event_location, pending_id)
-            # else: キュー追加はサイレント（push_message不要）
-            # 理由: push_messageを送るとLINEのQuickReplyボタンが消えてしまうため
 
             # バックグラウンドでCloudinaryにアップロードしてDBを更新
             def on_upload_complete(image_url, _pid=pending_id):
@@ -459,6 +505,18 @@ def handle_image(event):
             upload_image_to_cloudinary(image_data, on_upload_complete)
 
         else:
+            # イベントが見つからなかった → プレースホルダーを削除
+            if placeholder_id:
+                try:
+                    del_conn = get_conn()
+                    del_c = del_conn.cursor()
+                    del_c.execute("DELETE FROM pending WHERE id=%s AND user_id=%s",
+                                  (placeholder_id, user_id))
+                    del_conn.commit()
+                    del_conn.close()
+                except Exception as del_e:
+                    print(f"delete placeholder (not found) error: {del_e}")
+
             line_bot_api.push_message(
                 user_id,
                 TextSendMessage(text="⚠️ 画像から日付を見つけられませんでした。\n別の画像を試してみてください。")
@@ -466,6 +524,18 @@ def handle_image(event):
 
     except Exception as e:
         print(f"Error: {e}")
+        # エラー時もプレースホルダーを削除（キューが詰まるのを防ぐ）
+        if placeholder_id:
+            try:
+                del_conn = get_conn()
+                del_c = del_conn.cursor()
+                del_c.execute("DELETE FROM pending WHERE id=%s AND user_id=%s",
+                              (placeholder_id, user_id))
+                del_conn.commit()
+                del_conn.close()
+            except Exception as del_e:
+                print(f"delete placeholder (error case) error: {del_e}")
+
         line_bot_api.push_message(
             user_id,
             TextSendMessage(text="❌ エラーが発生しました。もう一度試してください。")
@@ -559,7 +629,6 @@ def handle_postback(event):
             new_datetime = params.get('datetime', '') if params else ''
             new_remind_at = new_datetime.replace('T', ' ').strip()
             if not new_remind_at:
-                # 日時が空の場合は何もしない（空文字列だと即時発火する）
                 conn.commit()
                 line_bot_api.reply_message(event.reply_token,
                                            TextSendMessage(text="⚠️ 日時の取得に失敗しました。もう一度お試しください。"))
@@ -599,9 +668,9 @@ def handle_text(event):
     c = conn.cursor()
 
     try:
-        # 編集待ち状態のpendingを確認（confirm以外のstate）
+        # 編集待ち状態のpendingを確認（confirm/processing以外のstate）
         c.execute("""SELECT id, event_name, remind_at, state, image_url, location
-                     FROM pending WHERE user_id = %s AND state != 'confirm'
+                     FROM pending WHERE user_id = %s AND state NOT IN ('confirm', 'processing')
                      ORDER BY created_at LIMIT 1""", (user_id,))
         editing = c.fetchone()
 
