@@ -19,7 +19,8 @@ from linebot.models import (
     QuickReply, QuickReplyButton)
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timedelta, date as dateobj
+from urllib.parse import quote
 import pytz
 
 JST = pytz.timezone('Asia/Tokyo')
@@ -42,6 +43,64 @@ cloudinary.config(
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ===== Google Maps URL生成 =====
+def make_maps_url(location):
+    """場所名・住所からGoogle MapsのURLを生成する"""
+    if not location or location in ('場所不明', ''):
+        return None
+    encoded = quote(location, safe='')
+    return f"https://www.google.com/maps/search/{encoded}/"
+
+
+# ===== 日付テキストを解析してYYYY-MM-DD形式で返す =====
+def parse_date_input(text):
+    """
+    「今日」「3月13日」「3/13」などを解析してYYYY-MM-DDを返す。
+    解析できない場合はNone。
+    """
+    today = datetime.now(JST).date()
+
+    if text in ('今日', '本日'):
+        return today.strftime('%Y-%m-%d')
+    if text in ('明日', 'あした', '翌日'):
+        return (today + timedelta(days=1)).strftime('%Y-%m-%d')
+    if text in ('明後日', 'あさって'):
+        return (today + timedelta(days=2)).strftime('%Y-%m-%d')
+
+    # X月X日 or X月X日
+    m = re.match(r'^(\d{1,2})月(\d{1,2})日?$', text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        for year in [today.year, today.year + 1]:
+            try:
+                return dateobj(year, month, day).strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+        return None
+
+    # X/X or X-X（年なし）
+    m = re.match(r'^(\d{1,2})[/\-](\d{1,2})$', text)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        for year in [today.year, today.year + 1]:
+            try:
+                return dateobj(year, month, day).strftime('%Y-%m-%d')
+            except ValueError:
+                pass
+        return None
+
+    # YYYY/MM/DD or YYYY-MM-DD
+    m = re.match(r'^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$', text)
+    if m:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return dateobj(year, month, day).strftime('%Y-%m-%d')
+        except ValueError:
+            return None
+
+    return None
 
 
 # ===== 画像をCloudinaryにアップロード（バックグラウンドで実行） =====
@@ -192,6 +251,8 @@ def check_and_send_reminders():
         for rid, user_id, event_name, image_url, location in reminders:
             try:
                 loc = location if location else "場所不明"
+                maps_url = make_maps_url(loc)
+                map_line = f"\n🗺 {maps_url}" if maps_url else ""
                 messages = []
                 if image_url:
                     messages.append(ImageSendMessage(
@@ -199,7 +260,7 @@ def check_and_send_reminders():
                         preview_image_url=image_url
                     ))
                 messages.append(TextSendMessage(
-                    text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n📍 {loc}\n楽しんできてください😊"
+                    text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n📍 {loc}{map_line}\n楽しんできてください😊"
                 ))
                 line_bot_api.push_message(user_id, messages)
                 c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (rid,))
@@ -242,13 +303,17 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
             original_content_url=image_url,
             preview_image_url=image_url
         ))
+    maps_url = make_maps_url(loc)
+    loc_line = f"📍 {loc}"
+    if maps_url:
+        loc_line += f"\n🗺 {maps_url}"
     messages.append(TextSendMessage(
         text=(
             f"📅 イベントを検出しました\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📌 {event_name}\n"
             f"⏰ {date_str} {time_str}\n"
-            f"📍 {loc}\n"
+            f"{loc_line}\n"
             f"━━━━━━━━━━━━━━━\n"
             f"下のボタンで確認・修正してください👇"
         ),
@@ -706,6 +771,9 @@ def handle_text(event):
                          "📋 【一覧を見る】\n"
                          "「一覧」と送ると登録済みリマインダーが表示されます。\n\n"
                          "━━━━━━━━━━━━━━━\n\n"
+                         "🔍 【日付で検索】\n"
+                         "「今日」「明日」「3月13日」「3/13」などで\nその日のリマインダーを確認できます。\n\n"
+                         "━━━━━━━━━━━━━━━\n\n"
                          "🗑️ 【削除する】\n"
                          "「削除 1」のように番号を指定して送ってください。\n\n"
                          "━━━━━━━━━━━━━━━\n\n"
@@ -742,7 +810,9 @@ def handle_text(event):
                 msg = "📋 設定中のリマインダー\n\n"
                 for i, (rid, name, remind_at, location) in enumerate(reminders, 1):
                     loc = location if location else "場所不明"
-                    msg += f"{i}. {name}\n   ⏰ {remind_at}\n   📍 {loc}\n\n"
+                    maps_url = make_maps_url(loc)
+                    map_line = f"\n   🗺 {maps_url}" if maps_url else ""
+                    msg += f"{i}. {name}\n   ⏰ {remind_at}\n   📍 {loc}{map_line}\n\n"
                 msg += "─────────────\n🗑️ 削除する →「削除 番号」\n✏️ 修正する →「修正 番号」"
             else:
                 msg = "設定中のリマインダーはありません。\nチラシの画像を送ってください！"
@@ -805,6 +875,9 @@ def handle_text(event):
             return
 
         # ✏️📍 編集待ち状態の処理
+        # ※ 日付検索より先にチェックする。
+        #   edit_name/edit_location 中に「3/13」「今日」などを入力した場合、
+        #   日付検索ではなくイベント名・場所として登録する必要があるため。
         if editing:
             edit_id, event_name, remind_at, state, image_url, location = editing
 
@@ -842,11 +915,46 @@ def handle_text(event):
                                            TextSendMessage(text=f"✅ 場所を「{text}」に変更しました！"))
                 return
 
+        # 📅 日付検索（「今日」「3月13日」「3/13」など）
+        # ※ 編集状態チェックの後に置くことで、編集中に日付らしい文字を打っても
+        #   誤って日付検索にならないようにしている
+        date_str_parsed = parse_date_input(text)
+        if date_str_parsed:
+            today_str = datetime.now(JST).strftime('%Y-%m-%d')
+            if date_str_parsed < today_str:
+                # 過去の日付
+                d = dateobj.fromisoformat(date_str_parsed)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"📅 {d.month}月{d.day}日は過去の日付です。\n過去のリマインダーは消去されています。"
+                ))
+            else:
+                # 当日または未来
+                c.execute("""SELECT event_name, remind_at, location FROM reminders
+                             WHERE user_id = %s AND remind_at LIKE %s AND sent = 0
+                             ORDER BY remind_at""",
+                          (user_id, f"{date_str_parsed}%"))
+                day_reminders = c.fetchall()
+                d = dateobj.fromisoformat(date_str_parsed)
+                label = f"{d.month}月{d.day}日"
+                if date_str_parsed == today_str:
+                    label = f"今日（{d.month}月{d.day}日）"
+                if day_reminders:
+                    msg = f"📅 {label}のリマインダー\n\n"
+                    for name, remind_at, location in day_reminders:
+                        loc = location if location else "場所不明"
+                        maps_url = make_maps_url(loc)
+                        map_line = f"\n   🗺 {maps_url}" if maps_url else ""
+                        msg += f"📌 {name}\n   ⏰ {remind_at}\n   📍 {loc}{map_line}\n\n"
+                else:
+                    msg = f"📅 {label}のリマインダーはありません。"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg.rstrip()))
+            return
+
         # デフォルトメッセージ
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n複数枚まとめて送ってもOK📸\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正\n🔄「クリア」→ 詰まった時のリセット"
+                text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n複数枚まとめて送ってもOK📸\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🔍「今日」「3/13」→ 日付検索\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正\n🔄「クリア」→ 詰まった時のリセット"
             )
         )
 
