@@ -349,6 +349,19 @@ def handle_image(event):
     try:
         pre_conn = get_conn()
         pre_c = pre_conn.cursor()
+
+        # 古い stale レコードを先にクリーンアップ
+        # ・'processing': 5分以上前 → サーバー再起動等で取りこぼされたもの
+        # ・'confirm': 2時間以上前 → 誰も操作しなかった放置レコード（ボタンが消えた等）
+        pre_c.execute("""DELETE FROM pending
+                         WHERE user_id = %s AND (
+                           (state = 'processing' AND created_at < NOW() - INTERVAL '5 minutes')
+                           OR (state = 'confirm'  AND created_at < NOW() - INTERVAL '2 hours')
+                         )""", (user_id,))
+        cleaned = pre_c.rowcount
+        if cleaned > 0:
+            print(f"Cleaned up {cleaned} stale records for user {user_id}")
+
         # state='processing' のプレースホルダーを挿入（後でOpenAI解析結果で上書き）
         pre_c.execute(
             """INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
@@ -701,9 +714,23 @@ def handle_text(event):
                          "━━━━━━━━━━━━━━━\n\n"
                          "🔔 【リマインダー通知】\n"
                          "設定した日時になると画像と一緒にお知らせが届きます。\n\n"
+                         "━━━━━━━━━━━━━━━\n\n"
+                         "🔄 【画像が反応しない場合】\n"
+                         "「クリア」と送ると確認待ちをリセットできます。\n\n"
                          "━━━━━━━━━━━━━━━\n"
                          "📖「説明書」→ この画面を表示"
                 )
+            )
+            return
+
+        # 🗑️ クリア（詰まった場合のリセット）
+        if text == 'クリア':
+            c.execute("DELETE FROM pending WHERE user_id = %s AND state IN ('confirm', 'processing')", (user_id,))
+            deleted = c.rowcount
+            conn.commit()
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"🗑️ 確認待ち・分析中の画像を{deleted}件クリアしました。\nもう一度画像を送ってください📸")
             )
             return
 
@@ -819,7 +846,7 @@ def handle_text(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n複数枚まとめて送ってもOK📸\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正"
+                text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n複数枚まとめて送ってもOK📸\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正\n🔄「クリア」→ 詰まった時のリセット"
             )
         )
 
