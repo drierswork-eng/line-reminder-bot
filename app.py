@@ -259,9 +259,13 @@ def check_and_send_reminders():
                         original_content_url=image_url,
                         preview_image_url=image_url
                     ))
-                messages.append(TextSendMessage(
-                    text=f"🔔 リマインダー！\n「{event_name}」の時間です！\n📍 {loc}{map_line}\n楽しんできてください😊"
-                ))
+                # 1時間前リマインダーと当日リマインダーで通知文を分ける
+                if event_name.startswith('⏰1時間前｜'):
+                    original_name = event_name[len('⏰1時間前｜'):]
+                    notify_text = f"⏰ あと1時間！\n「{original_name}」まで1時間です！\n📍 {loc}{map_line}\n準備を始めましょう😊"
+                else:
+                    notify_text = f"🔔 リマインダー！\n「{event_name}」の時間です！\n📍 {loc}{map_line}\n楽しんできてください😊"
+                messages.append(TextSendMessage(text=notify_text))
                 line_bot_api.push_message(user_id, messages)
                 c.execute("UPDATE reminders SET sent = 1 WHERE id = %s", (rid,))
             except Exception as e:
@@ -291,7 +295,7 @@ def parse_postback(data):
     return action, pid
 
 
-# ===== 確認メッセージを送る（QuickReply付き・5ボタン） =====
+# ===== 確認メッセージを送る（QuickReply付き・6ボタン） =====
 def send_confirm_message(user_id, event_name, remind_at, image_url=None, location="場所不明", pending_id=0):
     parts = remind_at.split(' ', 1)
     date_str = parts[0] if len(parts) > 0 and parts[0] else '2026-01-01'
@@ -320,6 +324,8 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
         quick_reply=QuickReply(items=[
             QuickReplyButton(action=PostbackAction(
                 label='✅ このままOK', data=f'action=confirm&pid={pending_id}')),
+            QuickReplyButton(action=PostbackAction(
+                label='⏰ 1時間前も通知', data=f'action=confirm_with_early&pid={pending_id}')),
             QuickReplyButton(action=PostbackAction(
                 label='✏️ 名前を修正', data=f'action=edit_name&pid={pending_id}')),
             QuickReplyButton(action=DatetimePickerAction(
@@ -651,6 +657,46 @@ def handle_postback(event):
                 line_bot_api.reply_message(event.reply_token,
                                            TextSendMessage(text="✅ リマインダーを登録しました！"))
 
+        # ⏰ 1時間前も通知 → イベント時刻 + 1時間前の2件を登録
+        elif action == 'confirm_with_early' and pid > 0:
+            c.execute("SELECT event_name, remind_at, image_url, location FROM pending WHERE id = %s AND user_id = %s",
+                      (pid, user_id))
+            row = c.fetchone()
+            if row:
+                event_name, remind_at, image_url, location = row
+                loc = location if location else "場所不明"
+
+                # メインリマインダー（イベント当日）
+                c.execute("INSERT INTO reminders (user_id, event_name, remind_at, image_url, location, source_pending_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                          (user_id, event_name, remind_at, image_url, loc, pid))
+
+                # 1時間前リマインダー
+                early_remind_at = remind_at  # フォールバック
+                try:
+                    remind_dt = datetime.strptime(remind_at, '%Y-%m-%d %H:%M')
+                    early_dt = remind_dt - timedelta(hours=1)
+                    early_remind_at = early_dt.strftime('%Y-%m-%d %H:%M')
+                    early_name = f"⏰1時間前｜{event_name}"
+                    c.execute("INSERT INTO reminders (user_id, event_name, remind_at, image_url, location, source_pending_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                              (user_id, early_name, early_remind_at, image_url, loc, pid))
+                except Exception as e:
+                    print(f"Early reminder calc error: {e}")
+
+                c.execute("DELETE FROM pending WHERE id = %s", (pid,))
+                conn.commit()
+                done_msg = (
+                    f"✅ 登録しました！\n"
+                    f"📌 {event_name}\n"
+                    f"⏰ {remind_at}\n"
+                    f"📍 {loc}\n\n"
+                    f"＋ 1時間前（{early_remind_at}）にも通知します🔔"
+                )
+                show_next_pending(user_id, event.reply_token, done_msg)
+            else:
+                conn.commit()
+                line_bot_api.reply_message(event.reply_token,
+                                           TextSendMessage(text="✅ リマインダーを登録しました！"))
+
         # ❌ キャンセル
         elif action == 'cancel' and pid > 0:
             c.execute("DELETE FROM pending WHERE id = %s AND user_id = %s", (pid, user_id))
@@ -711,8 +757,23 @@ def handle_postback(event):
                 line_bot_api.reply_message(event.reply_token,
                                            TextSendMessage(text="⚠️ 日時の取得に失敗しました。もう一度お試しください。"))
             else:
+                # メインリマインダーのsource_pending_idを取得
+                c.execute("SELECT source_pending_id FROM reminders WHERE id = %s AND user_id = %s",
+                          (rid, user_id))
+                src_row = c.fetchone()
                 c.execute("UPDATE reminders SET remind_at = %s WHERE id = %s AND user_id = %s",
                           (new_remind_at, rid, user_id))
+                # 対応する1時間前リマインダーの時刻も連動して更新
+                if src_row and src_row[0]:
+                    try:
+                        early_dt = datetime.strptime(new_remind_at, '%Y-%m-%d %H:%M') - timedelta(hours=1)
+                        early_remind_at = early_dt.strftime('%Y-%m-%d %H:%M')
+                        c.execute("""UPDATE reminders SET remind_at = %s
+                                     WHERE source_pending_id = %s AND id != %s
+                                     AND event_name LIKE '⏰1時間前｜%%'""",
+                                  (early_remind_at, src_row[0], rid))
+                    except Exception as e:
+                        print(f"Early reminder time update error: {e}")
                 conn.commit()
                 line_bot_api.reply_message(event.reply_token,
                                            TextSendMessage(text=f"✅ 日時を {new_remind_at} に変更しました！"))
@@ -793,26 +854,39 @@ def handle_text(event):
 
         # 🗑️ クリア（詰まった場合のリセット）
         if text == 'クリア':
-            c.execute("DELETE FROM pending WHERE user_id = %s AND state IN ('confirm', 'processing')", (user_id,))
+            # confirm/processing だけでなく edit_name/edit_location/edit_existing_* も全てクリア
+            # （修正ボタンを誤タップして抜け出せなくなった場合にも対応）
+            c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
             deleted = c.rowcount
             conn.commit()
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"🗑️ 確認待ち・分析中の画像を{deleted}件クリアしました。\nもう一度画像を送ってください📸")
+                TextSendMessage(text=f"🔄 {deleted}件の待機中データをリセットしました。\nもう一度画像を送ってください📸")
             )
             return
 
         # 📋 一覧表示
         if text == '一覧':
-            c.execute("SELECT id, event_name, remind_at, location FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
+            c.execute("""SELECT id, event_name, remind_at, location, source_pending_id
+                         FROM reminders WHERE user_id = %s AND sent = 0
+                         AND event_name NOT LIKE '⏰1時間前｜%%'
+                         ORDER BY remind_at""", (user_id,))
             reminders = c.fetchall()
+            # 1時間前リマインダーをsource_pending_idでマッピング
+            c.execute("""SELECT source_pending_id, remind_at FROM reminders
+                         WHERE user_id = %s AND sent = 0 AND event_name LIKE '⏰1時間前｜%%'""",
+                      (user_id,))
+            early_map = {row[0]: row[1] for row in c.fetchall()}
             if reminders:
                 msg = "📋 設定中のリマインダー\n\n"
-                for i, (rid, name, remind_at, location) in enumerate(reminders, 1):
+                for i, (rid, name, remind_at, location, src_pid) in enumerate(reminders, 1):
                     loc = location if location else "場所不明"
                     maps_url = make_maps_url(loc)
                     map_line = f"\n   🗺 {maps_url}" if maps_url else ""
-                    msg += f"{i}. {name}\n   ⏰ {remind_at}\n   📍 {loc}{map_line}\n\n"
+                    early_note = ""
+                    if src_pid and src_pid in early_map:
+                        early_note = f"\n   ⏰1時間前: {early_map[src_pid]}"
+                    msg += f"{i}. {name}\n   ⏰ {remind_at}\n   📍 {loc}{map_line}{early_note}\n\n"
                 msg += "─────────────\n🗑️ 削除する →「削除 番号」\n✏️ 修正する →「修正 番号」"
             else:
                 msg = "設定中のリマインダーはありません。\nチラシの画像を送ってください！"
@@ -823,11 +897,20 @@ def handle_text(event):
         delete_match = re.match(r'^削除\s*(\d+)$', text)
         if delete_match:
             index = int(delete_match.group(1))
-            c.execute("SELECT id, event_name FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
+            c.execute("""SELECT id, event_name, source_pending_id FROM reminders
+                         WHERE user_id = %s AND sent = 0
+                         AND event_name NOT LIKE '⏰1時間前｜%%'
+                         ORDER BY remind_at""", (user_id,))
             reminders = c.fetchall()
             if 1 <= index <= len(reminders):
-                rid, name = reminders[index - 1]
+                rid, name, src_pid = reminders[index - 1]
                 c.execute("DELETE FROM reminders WHERE id = %s", (rid,))
+                # 対応する1時間前リマインダーも削除
+                if src_pid:
+                    c.execute("""DELETE FROM reminders
+                                 WHERE source_pending_id = %s AND id != %s
+                                 AND event_name LIKE '⏰1時間前｜%%'""",
+                              (src_pid, rid))
                 conn.commit()
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🗑️ 「{name}」を削除しました。"))
             else:
@@ -838,7 +921,10 @@ def handle_text(event):
         edit_match = re.match(r'^修正\s*(\d+)$', text)
         if edit_match:
             index = int(edit_match.group(1))
-            c.execute("SELECT id, event_name, remind_at, location FROM reminders WHERE user_id = %s AND sent = 0 ORDER BY remind_at", (user_id,))
+            c.execute("""SELECT id, event_name, remind_at, location FROM reminders
+                         WHERE user_id = %s AND sent = 0
+                         AND event_name NOT LIKE '⏰1時間前｜%%'
+                         ORDER BY remind_at""", (user_id,))
             reminders = c.fetchall()
             if 1 <= index <= len(reminders):
                 rid, name, remind_at, location = reminders[index - 1]
@@ -899,7 +985,18 @@ def handle_text(event):
 
             elif state.startswith('edit_existing_name_'):
                 rid = int(state.split('_')[-1])
-                c.execute("UPDATE reminders SET event_name = %s WHERE id = %s AND user_id = %s", (text, rid, user_id))
+                # メインリマインダーのsource_pending_idを取得
+                c.execute("SELECT source_pending_id FROM reminders WHERE id = %s AND user_id = %s",
+                          (rid, user_id))
+                src_row = c.fetchone()
+                c.execute("UPDATE reminders SET event_name = %s WHERE id = %s AND user_id = %s",
+                          (text, rid, user_id))
+                # 対応する1時間前リマインダーの名前も連動して更新
+                if src_row and src_row[0]:
+                    c.execute("""UPDATE reminders SET event_name = %s
+                                 WHERE source_pending_id = %s AND id != %s
+                                 AND event_name LIKE '⏰1時間前｜%%'""",
+                              (f"⏰1時間前｜{text}", src_row[0], rid))
                 c.execute("DELETE FROM pending WHERE id = %s", (edit_id,))
                 conn.commit()
                 line_bot_api.reply_message(event.reply_token,
@@ -908,7 +1005,18 @@ def handle_text(event):
 
             elif state.startswith('edit_existing_location_'):
                 rid = int(state.split('_')[-1])
-                c.execute("UPDATE reminders SET location = %s WHERE id = %s AND user_id = %s", (text, rid, user_id))
+                # メインリマインダーのsource_pending_idを取得
+                c.execute("SELECT source_pending_id FROM reminders WHERE id = %s AND user_id = %s",
+                          (rid, user_id))
+                src_row = c.fetchone()
+                c.execute("UPDATE reminders SET location = %s WHERE id = %s AND user_id = %s",
+                          (text, rid, user_id))
+                # 対応する1時間前リマインダーの場所も連動して更新
+                if src_row and src_row[0]:
+                    c.execute("""UPDATE reminders SET location = %s
+                                 WHERE source_pending_id = %s AND id != %s
+                                 AND event_name LIKE '⏰1時間前｜%%'""",
+                              (text, src_row[0], rid))
                 c.execute("DELETE FROM pending WHERE id = %s", (edit_id,))
                 conn.commit()
                 line_bot_api.reply_message(event.reply_token,
@@ -931,6 +1039,7 @@ def handle_text(event):
                 # 当日または未来
                 c.execute("""SELECT event_name, remind_at, location FROM reminders
                              WHERE user_id = %s AND remind_at LIKE %s AND sent = 0
+                             AND event_name NOT LIKE '⏰1時間前｜%%'
                              ORDER BY remind_at""",
                           (user_id, f"{date_str_parsed}%"))
                 day_reminders = c.fetchall()
