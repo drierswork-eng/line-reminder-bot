@@ -468,15 +468,17 @@ def handle_image(event):
         except Exception as e:
             print(f"reply_message (分析中) error: {e}")
 
-    # ===== STEP 2: 画像データ取得 =====
-    message_content = line_bot_api.get_message_content(message_id)
-    image_data = b''
-    for chunk in message_content.iter_content():
-        image_data += chunk
-
-    image_base64 = base64.b64encode(image_data).decode('utf-8')
-
     try:
+        # ===== STEP 2: 画像データ取得 =====
+        # ※ try ブロック内に入れることで、LINEのAPI取得失敗時も
+        #   placeholder が 'processing' のまま残らないようにする
+        message_content = line_bot_api.get_message_content(message_id)
+        image_data = b''
+        for chunk in message_content.iter_content():
+            image_data += chunk
+
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+
         # ===== STEP 3: OpenAI で画像を分析 =====
         response = openai_client.chat.completions.create(
             model="gpt-4o",
