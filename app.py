@@ -347,6 +347,22 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
     line_bot_api.push_message(user_id, messages)
 
 
+# ===== reply_message → push_message フォールバック =====
+# バックグラウンドスレッドではreply_tokenが30秒で失効するため、
+# 失効・タイムアウト等で reply_message が失敗した場合は push_message にフォールバックする
+def safe_reply(reply_token, user_id, messages):
+    if not isinstance(messages, list):
+        messages = [messages]
+    try:
+        line_bot_api.reply_message(reply_token, messages[0] if len(messages) == 1 else messages)
+    except Exception as e:
+        print(f"reply_message失敗({e}) → push_messageにフォールバック")
+        try:
+            line_bot_api.push_message(user_id, messages)
+        except Exception as e2:
+            print(f"push_messageも失敗: {e2}")
+
+
 # ===== 次のpendingがあれば確認メッセージを出す =====
 def show_next_pending(user_id, reply_token, done_message):
     next_p = None
@@ -376,17 +392,17 @@ def show_next_pending(user_id, reply_token, done_message):
             suffix = f"\n\nあと{additional_waiting}件が待機/分析中です。次を確認します👇"
         else:
             suffix = "\n\n次の画像を確認します👇"
-        line_bot_api.reply_message(reply_token, TextSendMessage(
+        safe_reply(reply_token, user_id, TextSendMessage(
             text=f"{done_message}{suffix}"
         ))
         send_confirm_message(user_id, next_name, next_at, next_img, next_loc or "場所不明", next_id)
     elif remaining_processing > 0:
         # confirmはないがまだ分析中の画像がある
-        line_bot_api.reply_message(reply_token, TextSendMessage(
+        safe_reply(reply_token, user_id, TextSendMessage(
             text=f"{done_message}\n\nあと{remaining_processing}枚の画像を分析中です... しばらくお待ちください⏳"
         ))
     else:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=done_message))
+        safe_reply(reply_token, user_id, TextSendMessage(text=done_message))
 
 
 # ===== ヘルスチェック用エンドポイント（UptimeRobot用） =====
@@ -485,13 +501,8 @@ def handle_image(event):
     # 最初の画像だけ「分析中」リプライを送る
     # 2枚目以降はサイレント（reply_message を送るとQuickReplyボタンが消えるため）
     if is_first_in_queue:
-        try:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳")
-            )
-        except Exception as e:
-            print(f"reply_message (分析中) error: {e}")
+        safe_reply(event.reply_token, user_id,
+                   TextSendMessage(text="📸 画像を分析中です...\n少々お待ちください⏳"))
 
     try:
         # ===== STEP 2: 画像データ取得 =====
@@ -682,8 +693,8 @@ def handle_postback(event):
                 show_next_pending(user_id, event.reply_token, done_msg)
             else:
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text="✅ リマインダーを登録しました！"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text="✅ リマインダーを登録しました！"))
 
         # ⏰ 1時間前も通知 → イベント時刻 + 1時間前の2件を登録
         elif action == 'confirm_with_early' and pid > 0:
@@ -722,8 +733,8 @@ def handle_postback(event):
                 show_next_pending(user_id, event.reply_token, done_msg)
             else:
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text="✅ リマインダーを登録しました！"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text="✅ リマインダーを登録しました！"))
 
         # ❌ キャンセル
         elif action == 'cancel' and pid > 0:
@@ -735,8 +746,8 @@ def handle_postback(event):
         elif action == 'edit_name' and pid > 0:
             c.execute("UPDATE pending SET state = 'edit_name' WHERE id = %s AND user_id = %s", (pid, user_id))
             conn.commit()
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="✏️ 新しいイベント名を入力してください："))
+            safe_reply(event.reply_token, user_id,
+                       TextSendMessage(text="✏️ 新しいイベント名を入力してください："))
 
         # 📅 日時を修正
         elif action == 'edit_datetime' and pid > 0:
@@ -750,8 +761,8 @@ def handle_postback(event):
                 c.execute("UPDATE pending SET remind_at = %s, state = 'confirm' WHERE id = %s",
                           (new_remind_at, pid))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"📅 日時を {new_remind_at} に変更しました！\n内容を確認してください👇"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"📅 日時を {new_remind_at} に変更しました！\n内容を確認してください👇"))
                 send_confirm_message(user_id, event_name, new_remind_at, image_url, location, pid)
             else:
                 conn.commit()
@@ -760,8 +771,8 @@ def handle_postback(event):
         elif action == 'edit_location' and pid > 0:
             c.execute("UPDATE pending SET state = 'edit_location' WHERE id = %s AND user_id = %s", (pid, user_id))
             conn.commit()
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="📍 新しい場所を入力してください："))
+            safe_reply(event.reply_token, user_id,
+                       TextSendMessage(text="📍 新しい場所を入力してください："))
 
         # ✏️ 既存リマインダーの名前を修正
         elif action.startswith('edit_existing_name_') or raw_data.startswith('action=edit_existing_name_'):
@@ -772,8 +783,8 @@ def handle_postback(event):
                          VALUES (%s, '', '', %s, NULL, NULL)""",
                       (user_id, f'edit_existing_name_{rid}'))
             conn.commit()
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="✏️ 新しいイベント名を入力してください："))
+            safe_reply(event.reply_token, user_id,
+                       TextSendMessage(text="✏️ 新しいイベント名を入力してください："))
 
         # 📅 既存リマインダーの日時を修正
         elif raw_data.startswith('action=edit_existing_datetime_'):
@@ -782,8 +793,8 @@ def handle_postback(event):
             new_remind_at = new_datetime.replace('T', ' ').strip()
             if not new_remind_at:
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text="⚠️ 日時の取得に失敗しました。もう一度お試しください。"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text="⚠️ 日時の取得に失敗しました。もう一度お試しください。"))
             else:
                 # メインリマインダーのsource_pending_idを取得
                 c.execute("SELECT source_pending_id FROM reminders WHERE id = %s AND user_id = %s",
@@ -803,8 +814,8 @@ def handle_postback(event):
                     except Exception as e:
                         print(f"Early reminder time update error: {e}")
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"✅ 日時を {new_remind_at} に変更しました！"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"✅ 日時を {new_remind_at} に変更しました！"))
 
         # 📍 既存リマインダーの場所を修正
         elif raw_data.startswith('action=edit_existing_location_'):
@@ -814,8 +825,8 @@ def handle_postback(event):
                          VALUES (%s, '', '', %s, NULL, NULL)""",
                       (user_id, f'edit_existing_location_{rid}'))
             conn.commit()
-            line_bot_api.reply_message(event.reply_token,
-                                       TextSendMessage(text="📍 新しい場所を入力してください："))
+            safe_reply(event.reply_token, user_id,
+                       TextSendMessage(text="📍 新しい場所を入力してください："))
 
         else:
             pass  # 未知のアクション
@@ -843,8 +854,8 @@ def handle_text(event):
 
         # 📖 説明書
         if text == '説明書':
-            line_bot_api.reply_message(
-                event.reply_token,
+            safe_reply(
+                event.reply_token, user_id,
                 TextSendMessage(
                     text="📖 使い方ガイド\n"
                          "━━━━━━━━━━━━━━━\n\n"
@@ -887,10 +898,8 @@ def handle_text(event):
             c.execute("DELETE FROM pending WHERE user_id = %s", (user_id,))
             deleted = c.rowcount
             conn.commit()
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=f"🔄 {deleted}件の待機中データをリセットしました。\nもう一度画像を送ってください📸")
-            )
+            safe_reply(event.reply_token, user_id,
+                       TextSendMessage(text=f"🔄 {deleted}件の待機中データをリセットしました。\nもう一度画像を送ってください📸"))
             return
 
         # 📋 一覧表示
@@ -918,7 +927,7 @@ def handle_text(event):
                 msg += "─────────────\n🗑️ 削除する →「削除 番号」\n✏️ 修正する →「修正 番号」"
             else:
                 msg = "設定中のリマインダーはありません。\nチラシの画像を送ってください！"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+            safe_reply(event.reply_token, user_id, TextSendMessage(text=msg))
             return
 
         # 🗑️ 削除コマンド
@@ -940,9 +949,9 @@ def handle_text(event):
                                  AND event_name LIKE '⏰1時間前｜%%'""",
                               (src_pid, rid))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🗑️ 「{name}」を削除しました。"))
+                safe_reply(event.reply_token, user_id, TextSendMessage(text=f"🗑️ 「{name}」を削除しました。"))
             else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
+                safe_reply(event.reply_token, user_id, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
             return
 
         # ✏️ 修正コマンド
@@ -962,8 +971,8 @@ def handle_text(event):
                 time_str = parts[1] if len(parts) > 1 and parts[1] else '09:00'
                 # '✏️ ' プレフィックス3文字分を引いた37文字以内に切り詰める（合計40文字制限）
                 title = (name[:35] + '..') if len(name) > 37 else name
-                line_bot_api.reply_message(
-                    event.reply_token,
+                safe_reply(
+                    event.reply_token, user_id,
                     TemplateSendMessage(
                         alt_text=f'修正：{name}',
                         template=ButtonsTemplate(
@@ -985,7 +994,7 @@ def handle_text(event):
                     )
                 )
             else:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
+                safe_reply(event.reply_token, user_id, TextSendMessage(text="その番号のリマインダーが見つかりません。\n「一覧」で確認してください。"))
             return
 
         # ✏️📍 編集待ち状態の処理
@@ -998,16 +1007,16 @@ def handle_text(event):
             if state == 'edit_name':
                 c.execute("UPDATE pending SET event_name = %s, state = 'confirm' WHERE id = %s", (text, edit_id))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"✏️ イベント名を「{text}」に変更しました！\n内容を確認してください👇"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"✏️ イベント名を「{text}」に変更しました！\n内容を確認してください👇"))
                 send_confirm_message(user_id, text, remind_at, image_url, location or "場所不明", edit_id)
                 return
 
             elif state == 'edit_location':
                 c.execute("UPDATE pending SET location = %s, state = 'confirm' WHERE id = %s", (text, edit_id))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"📍 場所を「{text}」に変更しました！\n内容を確認してください👇"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"📍 場所を「{text}」に変更しました！\n内容を確認してください👇"))
                 send_confirm_message(user_id, event_name, remind_at, image_url, text, edit_id)
                 return
 
@@ -1027,8 +1036,8 @@ def handle_text(event):
                               (f"⏰1時間前｜{text}", src_row[0], rid))
                 c.execute("DELETE FROM pending WHERE id = %s", (edit_id,))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"✅ イベント名を「{text}」に変更しました！"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"✅ イベント名を「{text}」に変更しました！"))
                 return
 
             elif state.startswith('edit_existing_location_'):
@@ -1047,8 +1056,8 @@ def handle_text(event):
                               (text, src_row[0], rid))
                 c.execute("DELETE FROM pending WHERE id = %s", (edit_id,))
                 conn.commit()
-                line_bot_api.reply_message(event.reply_token,
-                                           TextSendMessage(text=f"✅ 場所を「{text}」に変更しました！"))
+                safe_reply(event.reply_token, user_id,
+                           TextSendMessage(text=f"✅ 場所を「{text}」に変更しました！"))
                 return
 
         # 📅 日付検索（「今日」「3月13日」「3/13」など）
@@ -1060,7 +1069,7 @@ def handle_text(event):
             if date_str_parsed < today_str:
                 # 過去の日付
                 d = dateobj.fromisoformat(date_str_parsed)
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                safe_reply(event.reply_token, user_id, TextSendMessage(
                     text=f"📅 {d.month}月{d.day}日は過去の日付です。\n過去のリマインダーは消去されています。"
                 ))
             else:
@@ -1084,12 +1093,12 @@ def handle_text(event):
                         msg += f"📌 {name}\n   ⏰ {remind_at}\n   📍 {loc}{map_line}\n\n"
                 else:
                     msg = f"📅 {label}のリマインダーはありません。"
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg.rstrip()))
+                safe_reply(event.reply_token, user_id, TextSendMessage(text=msg.rstrip()))
             return
 
         # デフォルトメッセージ
-        line_bot_api.reply_message(
-            event.reply_token,
+        safe_reply(
+            event.reply_token, user_id,
             TextSendMessage(
                 text="こんにちは！📅\n\nチラシや予定表の画像を送ると\n日付を読み取ってリマインダーを設定します！\n複数枚まとめて送ってもOK📸\n\n─────────────\n📖「説明書」→ 使い方を見る\n📋「一覧」→ リマインダー一覧\n🔍「今日」「3/13」→ 日付検索\n🗑️「削除 1」→ 1番目を削除\n✏️「修正 1」→ 1番目を修正\n🔄「クリア」→ 詰まった時のリセット"
             )
