@@ -10,7 +10,7 @@ import psycopg2.extras
 import cloudinary
 import cloudinary.uploader
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
+from linebot import LineBotApi, WebhookHandler, WebhookParser
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage, PostbackEvent,
@@ -42,6 +42,7 @@ cloudinary.config(
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+_parser = WebhookParser(LINE_CHANNEL_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -215,13 +216,14 @@ def init_db():
             except Exception:
                 pass
 
-    # 起動時に古い 'processing' レコードを削除（サーバー再起動後の取りこぼし防止）
+    # 起動時に全ての 'processing' レコードを削除（サーバー再起動後の取りこぼし防止）
+    # ※ サーバーが再起動した場合、処理中だったスレッドは全て死んでいるため
+    #   作成時刻に関わらず 'processing' レコードは全て詰まりレコードとして削除する
     try:
-        c.execute("""DELETE FROM pending WHERE state = 'processing'
-                     AND created_at < NOW() - INTERVAL '10 minutes'""")
+        c.execute("DELETE FROM pending WHERE state = 'processing'")
         deleted = c.rowcount
         if deleted > 0:
-            print(f"Cleaned up {deleted} stale 'processing' records.")
+            print(f"Cleaned up {deleted} stale 'processing' records on startup.")
     except Exception as e:
         print(f"Cleanup stale processing error: {e}")
 
@@ -333,7 +335,7 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
                 data=f'action=edit_datetime&pid={pending_id}',
                 mode='datetime',
                 initial=f'{date_str}T{time_str}',
-                min='2026-01-01T00:00',
+                min=datetime.now(JST).strftime('%Y-%m-%dT00:00'),
                 max='2030-12-31T23:59'
             )),
             QuickReplyButton(action=PostbackAction(
@@ -393,15 +395,36 @@ def health_check():
     return 'OK', 200
 
 
+# ===== イベントディスパッチャー（バックグラウンドスレッドから呼び出す） =====
+def _dispatch_event(event):
+    try:
+        if isinstance(event, MessageEvent) and isinstance(event.message, ImageMessage):
+            handle_image(event)
+        elif isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
+            handle_text(event)
+        elif isinstance(event, PostbackEvent):
+            handle_postback(event)
+    except Exception as e:
+        print(f"dispatch_event error: {type(e).__name__}: {e}")
+
+
 # ===== LINEのWebhookエンドポイント =====
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    # 署名を検証してすぐに200を返す
+    # LINEは30秒以内に200が返らないと同一webhookをリトライするため、
+    # バックグラウンドスレッドで処理することで二重処理（詰まり）を防ぐ
     try:
-        handler.handle(body, signature)
+        events = _parser.parse(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        print(f"Webhook parse error: {e}")
+        abort(400)
+    for event in events:
+        threading.Thread(target=_dispatch_event, args=(event,), daemon=True).start()
     return 'OK'
 
 
@@ -422,11 +445,11 @@ def handle_image(event):
         pre_c = pre_conn.cursor()
 
         # 古い stale レコードを先にクリーンアップ
-        # ・'processing': 5分以上前 → サーバー再起動等で取りこぼされたもの
+        # ・'processing': 3分以上前 → サーバー再起動等で取りこぼされたもの
         # ・'confirm': 2時間以上前 → 誰も操作しなかった放置レコード（ボタンが消えた等）
         pre_c.execute("""DELETE FROM pending
                          WHERE user_id = %s AND (
-                           (state = 'processing' AND created_at < NOW() - INTERVAL '5 minutes')
+                           (state = 'processing' AND created_at < NOW() - INTERVAL '3 minutes')
                            OR (state = 'confirm'  AND created_at < NOW() - INTERVAL '2 hours')
                          )""", (user_id,))
         cleaned = pre_c.rowcount
@@ -440,7 +463,10 @@ def handle_image(event):
             (user_id, '分析中...', '')
         )
         placeholder_id = pre_c.fetchone()[0]
+        # コミットを先に実行して他スレッドからも見えるようにする
+        pre_conn.commit()
         # 自分より前に挿入された confirm/processing レコードがあるか確認
+        # （commit後に SELECT することで他スレッドの INSERT も見える）
         pre_c.execute(
             """SELECT COUNT(*) FROM pending
                WHERE user_id = %s AND state IN ('confirm', 'processing') AND id < %s""",
@@ -448,7 +474,6 @@ def handle_image(event):
         )
         earlier_count = pre_c.fetchone()[0]
         is_first_in_queue = (earlier_count == 0)
-        pre_conn.commit()
     except Exception as e:
         print(f"handle_image placeholder insert error: {e}")
         placeholder_id = None
@@ -507,7 +532,8 @@ def handle_image(event):
                     }
                 ]
             }],
-            max_tokens=300
+            max_tokens=300,
+            timeout=90.0
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -950,7 +976,7 @@ def handle_text(event):
                                     data=f'action=edit_existing_datetime_{rid}',
                                     mode='datetime',
                                     initial=f'{date_str}T{time_str}',
-                                    min='2026-01-01T00:00',
+                                    min=datetime.now(JST).strftime('%Y-%m-%dT00:00'),
                                     max='2030-12-31T23:59'
                                 ),
                                 PostbackAction(label='📍 場所を修正', data=f'action=edit_existing_location_{rid}'),
