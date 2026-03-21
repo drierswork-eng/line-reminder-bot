@@ -300,9 +300,17 @@ def parse_postback(data):
 # ===== 確認メッセージを送る（QuickReply付き・6ボタン） =====
 def send_confirm_message(user_id, event_name, remind_at, image_url=None, location="場所不明", pending_id=0):
     parts = remind_at.split(' ', 1)
-    date_str = parts[0] if len(parts) > 0 and parts[0] else '2026-01-01'
+    date_str = parts[0] if len(parts) > 0 and parts[0] else datetime.now(JST).strftime('%Y-%m-%d')
     time_str = parts[1] if len(parts) > 1 and parts[1] else '09:00'
     loc = location if location else "場所不明"
+
+    # DatetimePicker の initial は min 以上でなければLINE APIがエラーを返す
+    # 過去日付のイベントチラシを解析した場合など initial < min になるケースを防ぐ
+    min_str = datetime.now(JST).strftime('%Y-%m-%dT00:00')
+    initial_str = f'{date_str}T{time_str}'
+    if initial_str < min_str:
+        initial_str = min_str  # 過去日付は今日の00:00に補正
+
     messages = []
     if image_url:
         messages.append(ImageSendMessage(
@@ -334,8 +342,8 @@ def send_confirm_message(user_id, event_name, remind_at, image_url=None, locatio
                 label='📅 日時を修正',
                 data=f'action=edit_datetime&pid={pending_id}',
                 mode='datetime',
-                initial=f'{date_str}T{time_str}',
-                min=datetime.now(JST).strftime('%Y-%m-%dT00:00'),
+                initial=initial_str,
+                min=min_str,
                 max='2030-12-31T23:59'
             )),
             QuickReplyButton(action=PostbackAction(
@@ -508,14 +516,17 @@ def handle_image(event):
         # ===== STEP 2: 画像データ取得 =====
         # ※ try ブロック内に入れることで、LINEのAPI取得失敗時も
         #   placeholder が 'processing' のまま残らないようにする
+        print(f"[handle_image] STEP2 start: get_message_content mid={message_id}")
         message_content = line_bot_api.get_message_content(message_id)
         image_data = b''
         for chunk in message_content.iter_content():
             image_data += chunk
+        print(f"[handle_image] STEP2 done: image_size={len(image_data)} bytes")
 
         image_base64 = base64.b64encode(image_data).decode('utf-8')
 
         # ===== STEP 3: OpenAI で画像を分析 =====
+        print(f"[handle_image] STEP3 start: OpenAI call")
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[{
@@ -548,6 +559,7 @@ def handle_image(event):
         )
 
         result_text = response.choices[0].message.content.strip()
+        print(f"[handle_image] STEP3 done: OpenAI raw={result_text[:200]}")
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         data = json.loads(json_match.group()) if json_match else {"found": False}
 
@@ -599,8 +611,17 @@ def handle_image(event):
             # 条件: 自分より前に処理中がなく、かつ自分が最古の confirm → 確認メッセージを表示
             # これにより複数画像が同時に届いても必ず1件だけ確認メッセージが表示される
             is_first = (earlier_processing == 0) and (oldest_confirm_id == pending_id)
+            print(f"[handle_image] OpenAI found: {event_name} / {remind_at} / {event_location} | is_first={is_first} | pid={pending_id}")
             if is_first:
-                send_confirm_message(user_id, event_name, remind_at, None, event_location, pending_id)
+                try:
+                    send_confirm_message(user_id, event_name, remind_at, None, event_location, pending_id)
+                    print(f"[handle_image] send_confirm_message OK pid={pending_id}")
+                except Exception as confirm_e:
+                    print(f"[handle_image] send_confirm_message FAILED: {confirm_e}")
+                    line_bot_api.push_message(
+                        user_id,
+                        TextSendMessage(text=f"⚠️ 確認画面の表示に失敗しました。\n「クリア」を送ってもう一度お試しください。\n（エラー: {type(confirm_e).__name__}）")
+                    )
 
             # バックグラウンドでCloudinaryにアップロードしてDBを更新
             def on_upload_complete(image_url, _pid=pending_id):
