@@ -490,7 +490,6 @@ def handle_image(event):
         # コミットを先に実行して他スレッドからも見えるようにする
         pre_conn.commit()
         # 自分より前に挿入された confirm/processing レコードがあるか確認
-        # （commit後に SELECT することで他スレッドの INSERT も見える）
         pre_c.execute(
             """SELECT COUNT(*) FROM pending
                WHERE user_id = %s AND state IN ('confirm', 'processing') AND id < %s""",
@@ -498,6 +497,41 @@ def handle_image(event):
         )
         earlier_count = pre_c.fetchone()[0]
         is_first_in_queue = (earlier_count == 0)
+
+        # ===== 新画像到着時: 既存の confirm 待ちレコードを自動登録 =====
+        # 新しい画像が届いたということは、前の手動確認を待たずに送ってきた
+        # → confirm 中のレコードを自動登録してから、新しい画像を confirm にする
+        pre_c.execute(
+            """SELECT id, event_name, remind_at, image_url, location
+               FROM pending
+               WHERE user_id = %s AND state = 'confirm'
+               ORDER BY id""",
+            (user_id,)
+        )
+        confirm_rows = pre_c.fetchall()
+        if confirm_rows:
+            auto_registered = []
+            for row in confirm_rows:
+                pid, ev_name, rem_at, img_url, loc = row
+                loc = loc or "場所不明"
+                pre_c.execute(
+                    """INSERT INTO reminders
+                         (user_id, event_name, remind_at, image_url, location, source_pending_id)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (user_id, ev_name, rem_at, img_url, loc, pid)
+                )
+                pre_c.execute("DELETE FROM pending WHERE id=%s AND user_id=%s", (pid, user_id))
+                auto_registered.append(f"📌 {ev_name}\n⏰ {rem_at}\n📍 {loc}")
+                print(f"[handle_image] AUTO-REGISTERED confirm pid={pid}: {ev_name}")
+            pre_conn.commit()
+
+            # 自動登録した旨を通知
+            notice = "⚡ 新しい画像が届いたため、前の画像を自動登録しました：\n\n" + "\n\n".join(auto_registered)
+            try:
+                line_bot_api.push_message(user_id, TextSendMessage(text=notice))
+            except Exception as push_e:
+                print(f"[handle_image] auto-register push failed: {push_e}")
+
     except Exception as e:
         print(f"handle_image placeholder insert error: {e}")
         placeholder_id = None
@@ -582,20 +616,19 @@ def handle_image(event):
                               (event_name, remind_at, event_location, placeholder_id, user_id))
                     pending_id = placeholder_id
                 else:
-                    # フォールバック（プレースホルダーが失敗した場合）
+                    # フォールバック
                     c.execute("""INSERT INTO pending (user_id, event_name, remind_at, state, image_url, location)
                                  VALUES (%s, %s, %s, 'confirm', NULL, %s) RETURNING id""",
                               (user_id, event_name, remind_at, event_location))
                     pending_id = c.fetchone()[0]
 
-                # 自分より前に 'processing' レコード（まだ分析中の画像）があるか確認
-                # → あれば自分は先頭ではない（それらが終わった後に表示される）
+                # 自分より前に 'processing' レコードがあるか確認
                 c.execute("""SELECT COUNT(*) FROM pending
                              WHERE user_id = %s AND state = 'processing' AND id < %s""",
                           (user_id, pending_id))
                 earlier_processing = c.fetchone()[0]
 
-                # 自分が最古の 'confirm' レコードか確認
+                # 自分が最古の 'confirm' か確認
                 c.execute("""SELECT MIN(id) FROM pending
                              WHERE user_id = %s AND state = 'confirm'""",
                           (user_id,))
@@ -608,10 +641,9 @@ def handle_image(event):
             finally:
                 conn.close()
 
-            # 条件: 自分より前に処理中がなく、かつ自分が最古の confirm → 確認メッセージを表示
-            # これにより複数画像が同時に届いても必ず1件だけ確認メッセージが表示される
             is_first = (earlier_processing == 0) and (oldest_confirm_id == pending_id)
-            print(f"[handle_image] OpenAI found: {event_name} / {remind_at} / {event_location} | is_first={is_first} | pid={pending_id}")
+            print(f"[handle_image] found: {event_name} / {remind_at} / {event_location} | is_first={is_first} | pid={pending_id}")
+
             if is_first:
                 try:
                     send_confirm_message(user_id, event_name, remind_at, None, event_location, pending_id)
@@ -630,16 +662,14 @@ def handle_image(event):
                     try:
                         conn2 = get_conn()
                         c2 = conn2.cursor()
-                        # pendingに更新（まだ確認待ちの場合）
                         c2.execute("UPDATE pending SET image_url=%s WHERE id=%s",
                                    (image_url, _pid))
                         pending_updated = c2.rowcount
-                        # すでにOKが押されてremindersに移動済みの場合もremindersを更新
                         c2.execute("UPDATE reminders SET image_url=%s WHERE source_pending_id=%s AND image_url IS NULL",
                                    (image_url, _pid))
                         reminders_updated = c2.rowcount
                         conn2.commit()
-                        print(f"Upload done pid={_pid}: pending_updated={pending_updated}, reminders_updated={reminders_updated}, url={image_url}")
+                        print(f"Upload done pid={_pid}: pending={pending_updated}, reminders={reminders_updated}")
                     except Exception as e:
                         print(f"DB update error: {e}")
                     finally:
